@@ -6,12 +6,12 @@ config.json
 *.key
 *.pem
 
-# 二进制
-login
-signin
-credit
-signin_bin
-trae2api
+# 二进制（根目录产物；无斜杠前缀会误伤 cmd/ 下同名源码目录 —— cmd/credit 丢失即此因）
+/login
+/signin
+/credit
+/signin_bin
+/trae2api
 /verify_work_credits
 /server
 
