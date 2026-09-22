@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -407,6 +408,64 @@ func (c *Client) EntUsage(a *auth.Auth) (remain, limit, used int64, packs int, e
 		packs++
 	}
 	return remain, limit, used, packs, nil
+}
+
+// PackDetail 单个权益包明细（含积分有效期）。
+type PackDetail struct {
+	Desc      string `json:"desc"`
+	Limit     int64  `json:"limit"`
+	Used      int64  `json:"used"`
+	StartTime int64  `json:"start_time"`
+	ExpireAt  int64  `json:"expire_at"`
+}
+
+// PackList 查询账号权益包明细（含每包积分过期时间，按过期时间升序）。
+// 数据源与 EntUsage 相同（ide_user_ent_usage），额外解析 expire_time/start_time；
+// 签到/登录赠送的积分是独立权益包，各自 30 天（或自然月）有效期，先进先出消耗。
+func (c *Client) PackList(a *auth.Auth) ([]PackDetail, error) {
+	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpEntUsage, bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return nil, err
+	}
+	UgHeaders(req, a)
+	data, err := c.doJSON(req)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		UserEntitlementPackList []struct {
+			DisplayDesc         string `json:"display_desc"`
+			ExpireTime          int64  `json:"expire_time"`
+			EntitlementBaseInfo struct {
+				StartTime int64 `json:"start_time"`
+				Quota     struct {
+					CreditsLimit int64 `json:"credits_limit"`
+				} `json:"quota"`
+			} `json:"entitlement_base_info"`
+			Usage struct {
+				CreditsAmount float64 `json:"credits_amount"`
+			} `json:"usage"`
+		} `json:"user_entitlement_pack_list"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("ent usage parse: %w", err)
+	}
+	var out []PackDetail
+	for _, p := range resp.UserEntitlementPackList {
+		l := p.EntitlementBaseInfo.Quota.CreditsLimit
+		if l <= 0 {
+			continue
+		}
+		out = append(out, PackDetail{
+			Desc:      p.DisplayDesc,
+			Limit:     l,
+			Used:      int64(p.Usage.CreditsAmount),
+			StartTime: p.EntitlementBaseInfo.StartTime,
+			ExpireAt:  p.ExpireTime,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ExpireAt < out[j].ExpireAt })
+	return out, nil
 }
 
 // GetUserInfo 查询账号信息（登录用）。

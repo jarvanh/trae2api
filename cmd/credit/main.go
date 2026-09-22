@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"time"
 
 	"trae2api/internal/auth"
 	"trae2api/internal/upstream"
@@ -32,6 +33,7 @@ type row struct {
 func main() {
 	dir := flag.String("dir", "auths", "auths 目录")
 	jsonOut := flag.Bool("json", false, "输出 JSON 数组")
+	packs := flag.Bool("packs", false, "展示权益包明细（含积分过期时间）")
 	flag.Parse()
 	uidFilter := ""
 	if flag.NArg() > 0 {
@@ -44,6 +46,32 @@ func main() {
 		os.Exit(1)
 	}
 	up := upstream.New()
+
+	// -packs：权益包明细（含积分过期时间）
+	if *packs {
+		for _, a := range auths {
+			if uidFilter != "" && a.UID != uidFilter {
+				continue
+			}
+			list, err := up.PackList(a)
+			if err != nil {
+				fmt.Printf("== %s (%s) 查询失败: %v\n", a.Nickname, a.UID, err)
+				continue
+			}
+			fmt.Printf("== %s (%s) 权益包 %d 个（按过期时间升序）==\n", a.Nickname, a.UID, len(list))
+			for _, p := range list {
+				remain := p.Limit - p.Used
+				warn := ""
+				if remain > 0 && p.ExpireAt > 0 && time.Until(time.Unix(p.ExpireAt, 0)) < 7*24*time.Hour {
+					warn = "  ⚠️ 未用完即将过期"
+				}
+				fmt.Printf("  %s · 已用 %d/%d · 过期 %s%s\n",
+					p.Desc, p.Used, p.Limit,
+					time.Unix(p.ExpireAt, 0).Format("2006-01-02 15:04"), warn)
+			}
+		}
+		return
+	}
 
 	var rows []row
 	for _, a := range auths {
