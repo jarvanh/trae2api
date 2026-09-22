@@ -314,6 +314,9 @@ func (h *Handler) modelList() []map[string]any {
 			if entry["context_length"] == 0 {
 				entry["context_length"] = 131072
 			}
+			if mi.Rate > 0 {
+				entry["consumption_rate"] = mi.Rate
+			}
 			out = append(out, entry)
 		}
 		return out

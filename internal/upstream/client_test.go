@@ -268,3 +268,22 @@ func TestCheckinStatusAndClaim(t *testing.T) {
 		t.Errorf("path=%s", path)
 	}
 }
+
+func TestConsumptionRate(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want float64
+	}{
+		{"正常倍率", `{"access":{"data":{"identity_list":[0]}},"consumption_rate":{"enable":true,"data":{"rate":0.48}}}`, 0.48},
+		{"未启用", `{"consumption_rate":{"enable":false,"data":{"rate":0.48}}}`, 0},
+		{"字段缺失", `{"access":{}}`, 0},
+		{"空串", ``, 0},
+		{"坏JSON", `not-json`, 0},
+	}
+	for _, c := range cases {
+		if got := consumptionRate(c.raw); got != c.want {
+			t.Errorf("%s: consumptionRate(%q)=%v want %v", c.name, c.raw, got, c.want)
+		}
+	}
+}

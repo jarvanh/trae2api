@@ -265,8 +265,9 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 type ModelInfo struct {
 	ID            string
 	Name          string
-	ContextWindow int64 // = maxInputTokens
-	MaxTokens     int64 // = maxOutputTokens
+	ContextWindow int64   // = maxInputTokens
+	MaxTokens     int64   // = maxOutputTokens
+	Rate          float64 // 上游消耗倍率（consumption_rate），0 = 未知
 }
 
 // FetchModels 拉 SOLO 模型表（get_detail_param，32 配置）。
@@ -292,10 +293,12 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	}
 	var resp struct {
 		ConfigInfoList []struct {
-			ConfigName    string `json:"config_name"`
+			ConfigName string `json:"config_name"`
 			DisplayConfig struct {
 				DisplayName string `json:"display_name"`
 			} `json:"display_config"`
+			// 内嵌 JSON 字符串：consumption_rate.data.rate 即客户端显示的模型倍率（如 0.48x）
+			DisplayContactConfig string `json:"display_contact_config"`
 			ModelDetailList []struct {
 				ModelName string `json:"model_name"`
 			} `json:"model_detail_list"`
@@ -312,12 +315,36 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		out = append(out, ModelInfo{
 			ID:   cfg.ConfigName,
 			Name: cfg.DisplayConfig.DisplayName,
+			Rate: consumptionRate(cfg.DisplayContactConfig),
 		})
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
 	return out, nil
+}
+
+// consumptionRate 从 display_contact_config 内嵌 JSON 提取 consumption_rate.data.rate。
+// 该字段是 JSON 字符串而非嵌套对象，需二次解析；缺失/禁用/解析失败返回 0。
+func consumptionRate(raw string) float64 {
+	if raw == "" {
+		return 0
+	}
+	var dcc struct {
+		ConsumptionRate struct {
+			Enable bool `json:"enable"`
+			Data   struct {
+				Rate float64 `json:"rate"`
+			} `json:"data"`
+		} `json:"consumption_rate"`
+	}
+	if err := json.Unmarshal([]byte(raw), &dcc); err != nil {
+		return 0
+	}
+	if !dcc.ConsumptionRate.Enable {
+		return 0
+	}
+	return dcc.ConsumptionRate.Data.Rate
 }
 
 // CheckinStatus 查询签到状态。
