@@ -21,6 +21,9 @@ import (
 	"trae2api/internal/upstream"
 )
 
+// cst 固定东八区：过期时间展示不随 runner 时区漂移（GitHub runner 是 UTC）。
+var cst = time.FixedZone("Asia/Shanghai", 8*3600)
+
 type row struct {
 	UID       string `json:"uid"`
 	Nickname  string `json:"nickname"`
@@ -77,7 +80,7 @@ func main() {
 					UID: a.UID, Nickname: a.Nickname, Desc: p.Desc,
 					Limit: p.Limit, Used: p.Used, Remain: p.Limit - p.Used,
 					ExpireAt: p.ExpireAt,
-					ExpireFmt: time.Unix(p.ExpireAt, 0).Format("01-02 15:04"),
+					ExpireFmt: time.Unix(p.ExpireAt, 0).In(cst).Format("2006-01-02 15:04"),
 				})
 			}
 		}
