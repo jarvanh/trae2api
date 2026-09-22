@@ -47,27 +47,60 @@ func main() {
 	}
 	up := upstream.New()
 
-	// -packs：权益包明细（含积分过期时间）
+	// -packs：权益包明细（含积分过期时间）；配合 -json 输出扁平数组供通知汇总
 	if *packs {
+		type packRow struct {
+			UID       string `json:"uid"`
+			Nickname  string `json:"nickname"`
+			Desc      string `json:"desc"`
+			Limit     int64  `json:"limit"`
+			Used      int64  `json:"used"`
+			Remain    int64  `json:"remain"`
+			ExpireAt  int64  `json:"expire_at"`
+			ExpireFmt string `json:"expire_fmt"`
+		}
+		var all []packRow
 		for _, a := range auths {
 			if uidFilter != "" && a.UID != uidFilter {
 				continue
 			}
 			list, err := up.PackList(a)
 			if err != nil {
+				if *jsonOut {
+					continue
+				}
 				fmt.Printf("== %s (%s) 查询失败: %v\n", a.Nickname, a.UID, err)
 				continue
 			}
-			fmt.Printf("== %s (%s) 权益包 %d 个（按过期时间升序）==\n", a.Nickname, a.UID, len(list))
 			for _, p := range list {
-				remain := p.Limit - p.Used
+				all = append(all, packRow{
+					UID: a.UID, Nickname: a.Nickname, Desc: p.Desc,
+					Limit: p.Limit, Used: p.Used, Remain: p.Limit - p.Used,
+					ExpireAt: p.ExpireAt,
+					ExpireFmt: time.Unix(p.ExpireAt, 0).Format("01-02 15:04"),
+				})
+			}
+		}
+		sort.Slice(all, func(i, j int) bool { return all[i].ExpireAt < all[j].ExpireAt })
+		if *jsonOut {
+			b, _ := json.MarshalIndent(all, "", "  ")
+			fmt.Println(string(b))
+			return
+		}
+		for _, a := range auths {
+			if uidFilter != "" && a.UID != uidFilter {
+				continue
+			}
+			fmt.Printf("== %s (%s) 权益包（按过期时间升序）==\n", a.Nickname, a.UID)
+			for _, p := range all {
+				if p.UID != a.UID {
+					continue
+				}
 				warn := ""
-				if remain > 0 && p.ExpireAt > 0 && time.Until(time.Unix(p.ExpireAt, 0)) < 7*24*time.Hour {
+				if p.Remain > 0 && p.ExpireAt > 0 && time.Until(time.Unix(p.ExpireAt, 0)) < 7*24*time.Hour {
 					warn = "  ⚠️ 未用完即将过期"
 				}
-				fmt.Printf("  %s · 已用 %d/%d · 过期 %s%s\n",
-					p.Desc, p.Used, p.Limit,
-					time.Unix(p.ExpireAt, 0).Format("2006-01-02 15:04"), warn)
+				fmt.Printf("  %s · 已用 %d/%d · 过期 %s%s\n", p.Desc, p.Used, p.Limit, p.ExpireFmt, warn)
 			}
 		}
 		return
