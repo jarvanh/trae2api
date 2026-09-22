@@ -5,7 +5,7 @@ services:
     restart: unless-stopped
     environment:
       - TZ=Asia/Shanghai
-      - TW2A_API_KEY=${TW2A_API_KEY:?set TW2A_API_KEY in .env or shell}
+      - TW2A_API_KEY=${TW2A_API_KEY:?set TW2A_API_KEY in /dropbox/self-hosted/trae2api/.env}
       # Work 通道运行模式：auto (智能自动模式，推荐) | native | bridge | disabled
       - TW2A_WORK_MODE=${TW2A_WORK_MODE:-auto}
       - TW2A_WORK_BRIDGE_URL=${TW2A_WORK_BRIDGE_URL:-http://host-gateway:7865}
@@ -16,6 +16,6 @@ services:
       - "7864:7864"
       - "18080:18080"
     volumes:
-      - ./auths:/app/auths
-      - ./data:/app/data
-      - ./config.json:/app/config.json:ro
+      - /dropbox/self-hosted/trae2api/auths:/app/auths
+      - /dropbox/self-hosted/trae2api/data:/app/data
+      - /dropbox/self-hosted/trae2api/config.json:/app/config.json:ro
