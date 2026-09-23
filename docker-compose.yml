@@ -1,6 +1,15 @@
 services:
   trae2api:
-    build: .
+    # 镜像 tag 直接复用 Release 完整 tag（如 trae2api:v2026.09.23-1e9ca73），
+    # 由 deploy.sh 自动解析最新 Release 后注入；手工构建时走默认值。
+    image: trae2api:${TRAE2API_IMAGE_VERSION:-v2026.09.23-1e9ca73}
+    build:
+      context: .
+      args:
+        IMAGE_VERSION: ${TRAE2API_IMAGE_VERSION:-v2026.09.23-1e9ca73}
+        TRAE2API_VERSION: ${TRAE2API_RELEASE_TAG:-v2026.09.23-1e9ca73}
+        TRAE2API_SHA256: ${TRAE2API_SHA256:-a95a013aee185b03c2377b282027b55318ba932a094b2f5bdd50c8461c103f0d}
+        BUILD_DATE: ${BUILD_DATE:-}
     container_name: trae2api
     restart: unless-stopped
     environment:
@@ -16,6 +25,7 @@ services:
       - "7864:7864"
       - "18080:18080"
     volumes:
+      # 数据持久化于 Dropbox（fuse 挂载，权限位恒 666，容器 uid 10001 可读写）
       - /dropbox/self-hosted/trae2api/auths:/app/auths
       - /dropbox/self-hosted/trae2api/data:/app/data
       - /dropbox/self-hosted/trae2api/config.json:/app/config.json:ro
