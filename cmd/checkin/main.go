@@ -84,12 +84,13 @@ func main() {
 	}
 	defer save()
 
-	today := time.Now().Format("2006-01-02")
+	// 东八区口径（runner 是 UTC）：日界与展示都用 CST，否则「今日已签」按 UTC
+	// 日界（北京时间 08:00）翻转，新一天的签到会被压到早上 8 点后才发起
+	cst := time.FixedZone("Asia/Shanghai", 8*3600)
+	today := time.Now().In(cst).Format("2006-01-02")
 	enc := json.NewEncoder(os.Stdout)
 	total := 0
 
-	// 东八区展示（runner 是 UTC，直接 Format 会差 8 小时，见 deploy skill 实测坑）
-	cst := time.FixedZone("Asia/Shanghai", 8*3600)
 	// fmtPlanned 计划时刻展示：当天只给 HH:MM，跨天（深夜冷却跨午夜）带上月-日
 	fmtPlanned := func(t time.Time) string {
 		pt, now := t.In(cst), time.Now().In(cst)
