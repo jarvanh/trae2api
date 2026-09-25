@@ -140,18 +140,26 @@ func main() {
 			}
 		}
 
-		// —— token 刷新：错峰后单轮流程可达数小时，发请求前确保 token 有效 ——
+		// —— 凭据保鲜：错峰后单轮流程可达数小时 ——
+		// 先从磁盘重读账号文件（常驻服务会持续刷新 token 并写回），拿到最新凭据；
+		// 仅当确实临近过期才自行刷新（与服务端的刷新存在轮换竞态，尽量避免自刷；
+		// 自刷失败也不记账号失败，交由签到接口按真实结果判定）。
+		if fp := a.FilePath; fp != "" {
+			if raw, rerr := os.ReadFile(fp); rerr == nil {
+				if na, perr := auth.Parse(raw); perr == nil {
+					a.Lock()
+					a.AccessToken = na.AccessToken
+					a.RefreshToken = na.RefreshToken
+					a.ExpiresAt = na.ExpiresAt
+					a.Unlock()
+				}
+			}
+		}
 		if a.NeedsRefresh(5 * time.Minute) {
 			if err := up.RefreshToken(a); err != nil {
-				r.Err = fmt.Sprintf("refresh: %v", err)
-				cs.LastFailAt = time.Now().Unix()
-				cs.FailCount++
-				_ = enc.Encode(r)
-				lastReq = time.Now()
-				continue
-			}
-			if err := a.SaveAtomic(); err != nil {
-				fmt.Fprintf(os.Stderr, "save %s: %v\n", st.UID, err)
+				fmt.Fprintf(os.Stderr, "refresh %s: %v（继续用现有凭据发起，成败交由签到接口判定）\n", st.UID, err)
+			} else if serr := a.SaveAtomic(); serr != nil {
+				fmt.Fprintf(os.Stderr, "save %s: %v\n", st.UID, serr)
 			}
 		}
 		lastReq = time.Now()
