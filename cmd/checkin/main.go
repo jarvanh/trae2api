@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"time"
@@ -47,6 +48,8 @@ type acctState struct {
 func main() {
 	dir := flag.String("dir", "auths", "auths 目录")
 	state := flag.String("state", "data/state.json", "pool 状态文件")
+	staggerMin := flag.Int("stagger-min", 30, "账号真实请求间最小间隔（分钟）")
+	staggerMax := flag.Int("stagger-max", 60, "账号真实请求间最大间隔（分钟）")
 	flag.Parse()
 
 	auths, err := auth.LoadDir(*dir)
@@ -72,6 +75,7 @@ func main() {
 	defer save()
 
 	today := time.Now().Format("2006-01-02")
+	var lastReq time.Time // 上次真实签到请求时刻（错峰基准；零请求分支不计入）
 	enc := json.NewEncoder(os.Stdout)
 	total, ok := 0, 0
 
@@ -84,6 +88,13 @@ func main() {
 			continue
 		}
 		total++
+		// 补齐 machineId（每账号互异 16 位数字，与 deviceId 同风格）并固化：
+		// 多账号设备画像进一步区分（主人 09-25 定「不同账号独立设备」）
+		if ch, err := a.EnsureCheckinMachineID(); err == nil && ch {
+			if err := a.SaveAtomic(); err != nil {
+				fmt.Fprintf(os.Stderr, "ensure machineId %s: %v\n", st.UID, err)
+			}
+		}
 		cs, exists := perAcct[st.UID]
 		if !exists {
 			cs = &acctState{}
@@ -110,6 +121,40 @@ func main() {
 				continue
 			}
 		}
+
+		// —— 错峰：真实请求之间保底随机间隔（默认 30–60 分钟，主人 09-25 定）——
+		// already/cooldown 分支零请求直接跳过，不计入间隔；只有真发请求才需错峰。
+		if !lastReq.IsZero() {
+			lo, hi := *staggerMin, *staggerMax
+			if hi < lo {
+				hi = lo
+			}
+			wait := time.Duration(lo) * time.Minute
+			if hi > lo {
+				wait += time.Duration(rand.Int63n(int64(hi-lo) * int64(time.Minute)))
+			}
+			if w := time.Until(lastReq.Add(wait)); w > 0 {
+				fmt.Fprintf(os.Stderr, "[stagger] uid=%s 距上次请求 %s，再等 %s\n",
+					st.UID, time.Since(lastReq).Round(time.Second), w.Round(time.Second))
+				time.Sleep(w)
+			}
+		}
+
+		// —— token 刷新：错峰后单轮流程可达数小时，发请求前确保 token 有效 ——
+		if a.NeedsRefresh(5 * time.Minute) {
+			if err := up.RefreshToken(a); err != nil {
+				r.Err = fmt.Sprintf("refresh: %v", err)
+				cs.LastFailAt = time.Now().Unix()
+				cs.FailCount++
+				_ = enc.Encode(r)
+				lastReq = time.Now()
+				continue
+			}
+			if err := a.SaveAtomic(); err != nil {
+				fmt.Fprintf(os.Stderr, "save %s: %v\n", st.UID, err)
+			}
+		}
+		lastReq = time.Now()
 
 		checkedIn, _, enable, err := up.CheckinStatus(a)
 		if err != nil {

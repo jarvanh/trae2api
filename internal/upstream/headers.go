@@ -54,6 +54,11 @@ func UgHeaders(req *http.Request, a *auth.Auth) {
 	if a.DeviceID != "" {
 		req.Header.Set("X-Device-Id", a.DeviceID)
 	}
+	// machineId 每账号互异（auth 文件固化），签到路径也带上以区分设备画像。
+	// 若上游对该头异常，回滚本段即可。
+	if a.MachineID != "" {
+		req.Header.Set("X-Machine-Id", a.MachineID)
+	}
 }
 
 // OAuthHeaders 设置 ExchangeToken / GetUserInfo 所需头（无签名，仅 UA）。

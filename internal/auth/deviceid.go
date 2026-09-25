@@ -48,3 +48,18 @@ func (a *Auth) EnsureCheckinDeviceID() (bool, error) {
 	a.DeviceID = id
 	return true, nil
 }
+
+// EnsureCheckinMachineID 在账号落盘前调用：仅当 MachineID 为空时才自动生成并写入。
+// 与 deviceId 同风格（16 位纯数字、互异），用于 X-Machine-Id 头的账号级区分。
+// 已有的（用户导入/真实注册的）machineId 一律保留，不覆盖。
+func (a *Auth) EnsureCheckinMachineID() (bool, error) {
+	if a.MachineID != "" {
+		return false, nil
+	}
+	id, err := NewCheckinDeviceID()
+	if err != nil {
+		return false, err
+	}
+	a.MachineID = id
+	return true, nil
+}
