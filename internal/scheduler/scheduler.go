@@ -1,4 +1,4 @@
-﻿// Package scheduler 定时任务：每日签到 + token 预刷新。
+// Package scheduler 定时任务：每日签到 + token 预刷新。
 // 签到成功后重新查积分，积分 > 0 的冷却账号自动解冻。
 package scheduler
 
@@ -8,6 +8,7 @@ import (
 	"log"
 	"time"
 
+	"trae2api/internal/auth"
 	"trae2api/internal/pool"
 	"trae2api/internal/upstream"
 )
@@ -86,7 +87,7 @@ func contains(hours []int, h int) bool {
 	return false
 }
 
-// RunCheckinNow 立即对所有账号执行签到 + 积分刷新 + 解冻。
+// RunCheckinNow 立即对所有账号执行签到 + 积分刷新 + 解冻 + 过期探测。
 // 冷却中的账号也参与（签到就是为了解冻它们）；禁用的跳过。
 func (s *Scheduler) RunCheckinNow() {
 	for _, st := range s.cfg.Pool.List() {
@@ -114,10 +115,32 @@ func (s *Scheduler) RunCheckinNow() {
 		remain, err := s.cfg.Upstream.UserEntUsage(a)
 		if err != nil {
 			log.Printf("ent-usage %s: %v", st.UID, err)
-			continue
+		} else {
+			s.cfg.Pool.ReenableIfCredits(st.UID, remain)
 		}
-		s.cfg.Pool.ReenableIfCredits(st.UID, remain)
+		// 探测最早到期权益包：挑选规则①的数据源。
+		// 失败不影响本轮其余流程（排序键会退化为 0 → 按规则②积分最少裁决）。
+		s.probeNearestExpire(st.UID, a)
 	}
+}
+
+// probeNearestExpire 拉取权益包明细，把最早到期的未用完包时间注入 pool。
+// PackList 已按 expire_at 升序，取第一个还有余额的包即可。
+func (s *Scheduler) probeNearestExpire(uid string, a *auth.Auth) {
+	packs, err := s.cfg.Upstream.PackList(a)
+	if err != nil {
+		log.Printf("pack-list %s: %v", uid, err)
+		return
+	}
+	for _, p := range packs {
+		if p.Limit-p.Used <= 0 {
+			continue // 已耗尽，跳过
+		}
+		s.cfg.Pool.SetNearestExpire(uid, p.ExpireAt)
+		return
+	}
+	// 名下已无未用完的包 → 置 0（未探测同义），不参与规则①竞争
+	s.cfg.Pool.SetNearestExpire(uid, 0)
 }
 
 // RunRefreshNow 立即对所有账号刷新 token；session 失效的自动禁用。

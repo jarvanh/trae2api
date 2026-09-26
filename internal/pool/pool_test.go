@@ -9,7 +9,8 @@ import (
 	"trae2api/internal/auth"
 )
 
-func TestPickHighestCredits(t *testing.T) {
+// 未探测过期时间时规则①打平，退化为规则②「积分最少者胜」。
+func TestPickLeastCreditsWhenNoExpireData(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Add(&auth.Auth{UID: "u2"})
@@ -18,8 +19,68 @@ func TestPickHighestCredits(t *testing.T) {
 	p.SetCredits("u2", 500)
 	p.SetCredits("u3", 300)
 	got := p.Pick()
+	if got == nil || got.UID != "u1" {
+		t.Fatalf("pick=%+v want u1 (least credits)", got)
+	}
+}
+
+// 规则①：最早过期优先，压过规则②（哪怕它积分最多）。
+func TestPickEarliestExpireWins(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.SetCredits("u1", 9000)
+	p.SetCredits("u2", 10)
+	now := time.Now()
+	p.SetNearestExpire("u1", now.Add(30*24*time.Hour).Unix()) // 一个月后
+	p.SetNearestExpire("u2", now.Add(2*time.Hour).Unix())     // 两小时后到期
+	got := p.Pick()
 	if got == nil || got.UID != "u2" {
-		t.Fatalf("pick=%+v want u2", got)
+		t.Fatalf("pick=%+v want u2 (earliest expire)", got)
+	}
+}
+
+// 规则①并列 → 规则②积分最少者胜。
+func TestPickEqualExpireThenLeastCredits(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.SetCredits("u1", 700)
+	p.SetCredits("u2", 200)
+	same := time.Now().Add(24 * time.Hour).Unix()
+	p.SetNearestExpire("u1", same)
+	p.SetNearestExpire("u2", same)
+	got := p.Pick()
+	if got == nil || got.UID != "u2" {
+		t.Fatalf("pick=%+v want u2 (same expire, least credits)", got)
+	}
+}
+
+// 未探测（0）视为无穷远，必须排在已探明账号之后。
+func TestPickProbedBeatsUnprobed(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.SetCredits("u1", 1)    // 积分最少，但未探测 → 应排最后
+	p.SetCredits("u2", 9999) // 积分最多，但两小时后到期
+	p.SetNearestExpire("u2", time.Now().Add(time.Hour).Unix())
+	got := p.Pick()
+	if got == nil || got.UID != "u2" {
+		t.Fatalf("pick=%+v want u2 (u1 unprobed ranks last)", got)
+	}
+}
+
+func TestSetNearestExpire(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	ts := time.Now().Add(3 * time.Hour).Unix()
+	p.SetNearestExpire("u1", ts)
+	if got := p.NearestExpire("u1"); got != ts {
+		t.Fatalf("nearest=%d want %d", got, ts)
+	}
+	st, _ := p.Status("u1")
+	if st.NearestExpire != ts {
+		t.Fatalf("status nearest=%d want %d", st.NearestExpire, ts)
 	}
 }
 
@@ -416,29 +477,29 @@ func TestPickAffinity(t *testing.T) {
 	p.SetCredits("u1", 100)
 	p.SetCredits("u2", 200)
 
-	// 首选 u2
+	// 未探测过期 → 规则②积分最少者优先 → 首选 u1
 	got1 := p.PickAffinity("sess-1", nil)
-	if got1 == nil || got1.UID != "u2" {
-		t.Fatalf("expected u2, got %+v", got1)
+	if got1 == nil || got1.UID != "u1" {
+		t.Fatalf("expected u1, got %+v", got1)
 	}
 
-	// 此时即便 u1 积分上升，sess-1 仍应粘性锁定在 u2
-	p.SetCredits("u1", 999)
+	// 此时即便 u2 积分降到最少，sess-1 仍应粘性锁定在 u1
+	p.SetCredits("u2", 1)
 	got2 := p.PickAffinity("sess-1", nil)
-	if got2 == nil || got2.UID != "u2" {
-		t.Fatalf("expected sticky u2, got %+v", got2)
+	if got2 == nil || got2.UID != "u1" {
+		t.Fatalf("expected sticky u1, got %+v", got2)
 	}
 
-	// 新会话 sess-2 会择优选择更高积分的 u1
+	// 新会话 sess-2 按规则序择优：积分更少的 u2
 	got3 := p.PickAffinity("sess-2", nil)
-	if got3 == nil || got3.UID != "u1" {
-		t.Fatalf("expected u1 for sess-2, got %+v", got3)
+	if got3 == nil || got3.UID != "u2" {
+		t.Fatalf("expected u2 for sess-2, got %+v", got3)
 	}
 
-	// 当 u2 冷却时，sess-1 自动漂移至 u1
-	p.Cooldown("u2", CoolSoft, time.Minute, "rate limit")
+	// 当 u1 冷却时，sess-1 自动漂移至 u2
+	p.Cooldown("u1", CoolSoft, time.Minute, "rate limit")
 	got4 := p.PickAffinity("sess-1", nil)
-	if got4 == nil || got4.UID != "u1" {
-		t.Fatalf("expected failover to u1, got %+v", got4)
+	if got4 == nil || got4.UID != "u2" {
+		t.Fatalf("expected failover to u2, got %+v", got4)
 	}
 }

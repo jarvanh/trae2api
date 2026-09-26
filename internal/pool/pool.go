@@ -1,5 +1,10 @@
 // Package pool 账号池：内存索引 + 冷却/禁用状态机 + state.json 持久化。
-// 挑选策略：healthy 账号中剩余积分最多者（SPEC §4.7）。
+//
+// 挑选策略（主人 2026-09-26 定，严格规则序，非加权）：
+//
+//	① 名下有最早到期权益包的账号优先 —— 临期积分必须先消耗
+//	② 并列时剩余积分最少者优先
+//	③ 仍并列时 UID 升序（稳定，避免 map 随机遍历抖动）
 package pool
 
 import (
@@ -12,6 +17,10 @@ import (
 
 	"trae2api/internal/auth"
 )
+
+// unknownExpire 未探测到权益包时的排序键：视为无穷远，排在所有已知账号之后。
+// 理由：宁可让已探明的临期账号先上，也不要让未知账号抢占位置。
+const unknownExpire int64 = 1 << 62
 
 // CoolKind 冷却类型。
 type CoolKind int
@@ -36,16 +45,18 @@ func (k CoolKind) String() string {
 
 // Status 单个账号对外暴露的状态（脱敏，不含 token）。
 type Status struct {
-	UID         string    `json:"uid"`
-	Nickname    string    `json:"nickname,omitempty"`
-	Credits     int64     `json:"credits"`
-	WorkCredits float64   `json:"work_credits"`
-	Cooling     bool      `json:"cooling"`
-	Until       time.Time `json:"until,omitempty"`
-	Reason      string    `json:"reason,omitempty"`
-	WorkCooling bool      `json:"work_cooling"`
-	WorkUntil   time.Time `json:"work_until,omitempty"`
-	WorkReason  string    `json:"work_reason,omitempty"`
+	UID      string `json:"uid"`
+	Nickname string `json:"nickname,omitempty"`
+	Credits  int64  `json:"credits"`
+	// NearestExpire 最早到期的权益包时间（0 表示未探测），挑选规则①的排序键。
+	NearestExpire int64     `json:"nearest_expire,omitempty"`
+	WorkCredits   float64   `json:"work_credits"`
+	Cooling       bool      `json:"cooling"`
+	Until         time.Time `json:"until,omitempty"`
+	Reason        string    `json:"reason,omitempty"`
+	WorkCooling   bool      `json:"work_cooling"`
+	WorkUntil     time.Time `json:"work_until,omitempty"`
+	WorkReason    string    `json:"work_reason,omitempty"`
 	// Disabled = session 失效硬禁用（需重登或换文件恢复）；Enabled = 软开关（用户可逆启停）。
 	// 对外暴露：Disabled 与 Enabled 都为 false 才算可被 Pick（healthy）。
 	Disabled bool `json:"disabled"`
@@ -61,17 +72,20 @@ type Status struct {
 }
 
 type entry struct {
-	a            *auth.Auth
-	credits      int64
-	workCredits  float64
-	disabled     bool // session dead 硬禁用
-	enabled      bool // 用户软开关（默认 true），false 时 Pick 跳过
-	reason       string
-	until        time.Time
-	workReason   string
-	workUntil    time.Time
-	errCount     int
-	workErrCount int
+	a *auth.Auth
+	// nearestExpire 账号名下最早到期的未用完权益包时间（Unix 秒），0 表示未探测。
+	// 由 SetNearestExpire 注入（数据源 upstream.PackList），是挑选规则①的依据。
+	nearestExpire int64
+	credits       int64
+	workCredits   float64
+	disabled      bool // session dead 硬禁用
+	enabled       bool // 用户软开关（默认 true），false 时 Pick 跳过
+	reason        string
+	until         time.Time
+	workReason    string
+	workUntil     time.Time
+	errCount      int
+	workErrCount  int
 
 	// 运行态在途租约与三因子统计
 	inFlight     int
@@ -272,18 +286,43 @@ func (p *Pool) SetEnabled(uid string, enabled bool, reason string) bool {
 	return true
 }
 
-// Pick 返回 healthy 中积分最高的账号；无可用返回 nil。
+// Pick 返回规则序最优的账号；无可用返回 nil。
 func (p *Pool) Pick() *auth.Auth {
 	return p.PickExcluding(nil)
 }
 
+// expireKey 规则①的排序键：最早到期时间；未探测（0）视为无穷远排最后。
+func expireKey(e *entry) int64 {
+	if e.nearestExpire <= 0 {
+		return unknownExpire
+	}
+	return e.nearestExpire
+}
+
+// betterEntry 严格规则序比较（非加权）：两条规则依次判定，
+// 前一条定不出胜负才看下一条，全部并列则比 UID 保证结果稳定。
+//
+//	① 最早过期者胜（先消耗临期积分，避免过期作废）
+//	② 并列则积分最少者胜（匀一匀，防止旱的旱死涝的涝死）
+//	③ 再并列则 UID 升序
+func betterEntry(cand, best *entry, candUID, bestUID string) bool {
+	a, b := expireKey(cand), expireKey(best)
+	if a != b {
+		return a < b
+	}
+	if cand.credits != best.credits {
+		return cand.credits < best.credits
+	}
+	return candUID < bestUID
+}
+
 // PickExcluding 同上，但跳过 tried 中的 uid（请求级轮换）。
-// 优化：当积分相同时按 UID 升序稳定排序，避免 Go map 随机遍历导致在相同积分账号间跳跃。
 func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
 	var best *entry
+	var bestUID string
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
 			continue
@@ -291,8 +330,8 @@ func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
 		if !e.healthy(now) {
 			continue
 		}
-		if best == nil || e.credits > best.credits || (e.credits == best.credits && uid < best.a.UID) {
-			best = e
+		if best == nil || betterEntry(e, best, uid, bestUID) {
+			best, bestUID = e, uid
 		}
 	}
 	if best == nil {
@@ -303,36 +342,15 @@ func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
 
 const minPickGap = 100 * time.Millisecond
 
-// weightOf 计算三因子调度权重（借鉴自 workbuddy2api）：
-// 1. credits 占比 × 10
-// 2. 闲置补偿（每闲置 1h 权重 +0.5，上限 5.0）
-// 3. 历史成功率 × 3
-func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
-	w := 1.0
-	if maxCredits > 0 && e.credits > 0 {
-		w += (float64(e.credits) / float64(maxCredits)) * 10.0
-	}
-	if !e.lastUsed.IsZero() {
-		idleH := now.Sub(e.lastUsed).Hours()
-		if idleH > 0 {
-			idleW := idleH * 0.5
-			if idleW > 5.0 {
-				idleW = 5.0
-			}
-			w += idleW
-		}
-	}
-	total := e.successCount + e.errTotal
-	if total > 0 {
-		sr := float64(e.successCount) / float64(total)
-		w += sr * 3.0
-	}
-	return w
-}
-
-// pickBestCandidateLocked 综合健康检查、在途租约、三因子权重与防惊群窗口选号。
+// pickBestCandidateLocked 综合健康检查、在途租约、规则序与防惊群窗口选号。
+// 排序口径与 PickExcluding 完全一致（betterEntry），保证两条选号路径行为统一；
+// 这里额外叠加在途租约筛选与 100ms 防惊群窗口（短名单内优先挑久未使用的）。
 func (p *Pool) pickBestCandidateLocked(tried map[string]bool, now time.Time) *entry {
-	var cands []*entry
+	type uidEntry struct {
+		uid string
+		e   *entry
+	}
+	ces := make([]uidEntry, 0, len(p.byUID))
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
 			continue
@@ -343,47 +361,30 @@ func (p *Pool) pickBestCandidateLocked(tried map[string]bool, now time.Time) *en
 		if p.inFlightFull(e) {
 			continue
 		}
-		cands = append(cands, e)
+		ces = append(ces, uidEntry{uid: uid, e: e})
 	}
 	// 若全部健康账号均占满在途并发，放宽在途限制
-	if len(cands) == 0 {
+	if len(ces) == 0 {
 		for uid, e := range p.byUID {
 			if tried != nil && tried[uid] {
 				continue
 			}
 			if e.healthy(now) {
-				cands = append(cands, e)
+				ces = append(ces, uidEntry{uid: uid, e: e})
 			}
 		}
 	}
-	if len(cands) == 0 {
+	if len(ces) == 0 {
 		return nil
 	}
 
-	var maxCredits int64
-	for _, e := range cands {
-		if e.credits > maxCredits {
-			maxCredits = e.credits
-		}
-	}
-
-	type weighted struct {
-		e *entry
-		w float64
-	}
-	ws := make([]weighted, len(cands))
-	for i, e := range cands {
-		ws[i] = weighted{e: e, w: p.weightOf(e, maxCredits, now)}
-	}
-	sort.Slice(ws, func(i, j int) bool {
-		if ws[i].w != ws[j].w {
-			return ws[i].w > ws[j].w
-		}
-		return ws[i].e.a.UID < ws[j].e.a.UID
+	// 严格规则序（同 PickExcluding）：最早过期 → 积分最少 → UID 升序
+	sort.Slice(ces, func(i, j int) bool {
+		return betterEntry(ces[i].e, ces[j].e, ces[i].uid, ces[j].uid)
 	})
 	top := make([]*entry, 0, 5)
-	for i := 0; i < len(ws) && i < 5; i++ {
-		top = append(top, ws[i].e)
+	for i := 0; i < len(ces) && i < 5; i++ {
+		top = append(top, ces[i].e)
 	}
 
 	eligible := make([]*entry, 0, len(top))
@@ -589,6 +590,28 @@ func (p *Pool) NoteWorkSuccess(uid string) {
 	}
 }
 
+// SetNearestExpire 更新账号名下最早到期的未用完权益包时间（Unix 秒）。
+// 0 表示尚未探测（或名下已无未用完的包），排序时按 unknownExpire 排最后。
+// 数据源：upstream.PackList（已按 expire_at 升序），调用方取第一个 remain>0 的包。
+func (p *Pool) SetNearestExpire(uid string, expireAt int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		e.nearestExpire = expireAt
+	}
+	// 排序键是上游派生数据，不落 state.json（重启后由刷新循环重新探测）
+}
+
+// NearestExpire 返回账号当前的最早到期时间（0 表示未探测）。
+func (p *Pool) NearestExpire(uid string) int64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if e, ok := p.byUID[uid]; ok {
+		return e.nearestExpire
+	}
+	return 0
+}
+
 // SetCredits 更新账号积分。
 func (p *Pool) SetCredits(uid string, credits int64) {
 	p.mu.Lock()
@@ -705,24 +728,26 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		nick = e.a.Nickname
 	}
 	return Status{
-		UID:          uid,
-		Nickname:     nick,
-		Credits:      e.credits,
-		WorkCredits:  e.workCredits,
-		Cooling:      !e.until.IsZero() && now.Before(e.until),
-		Until:        e.until,
-		Reason:       e.reason,
-		WorkCooling:  !e.workUntil.IsZero() && now.Before(e.workUntil),
-		WorkUntil:    e.workUntil,
-		WorkReason:   e.workReason,
-		Disabled:     e.disabled,
-		Enabled:      e.enabled,
-		ErrCount:     e.errCount,
-		InFlight:     e.inFlight,
-		SuccessCount: e.successCount,
-		ErrTotal:     e.errTotal,
-		LastSuccess:  e.lastSuccess,
-		LastErr:      e.lastErr,
+		UID:         uid,
+		Nickname:    nick,
+		Credits:     e.credits,
+		WorkCredits: e.workCredits,
+		// NearestExpire 仅作观测/排障用（0 表示未探测）
+		NearestExpire: e.nearestExpire,
+		Cooling:       !e.until.IsZero() && now.Before(e.until),
+		Until:         e.until,
+		Reason:        e.reason,
+		WorkCooling:   !e.workUntil.IsZero() && now.Before(e.workUntil),
+		WorkUntil:     e.workUntil,
+		WorkReason:    e.workReason,
+		Disabled:      e.disabled,
+		Enabled:       e.enabled,
+		ErrCount:      e.errCount,
+		InFlight:      e.inFlight,
+		SuccessCount:  e.successCount,
+		ErrTotal:      e.errTotal,
+		LastSuccess:   e.lastSuccess,
+		LastErr:       e.lastErr,
 	}
 }
 

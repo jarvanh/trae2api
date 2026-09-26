@@ -129,7 +129,9 @@ func TestChatRotatesOnPlanLimit(t *testing.T) {
 		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
 		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
 	)
-	p.SetCredits("bad", 2000)
+	// 规则②「积分最少优先」→ bad 必须是最少那个才能被首轮选中；
+	// 它撞 1005 plan_limit 后轮换到 good，正是本用例要验的行为。
+	p.SetCredits("bad", 500)
 	p.SetCredits("good", 1000)
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
@@ -668,7 +670,6 @@ func TestSessionAffinityRouting(t *testing.T) {
 	p.Add(&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999})
 	p.SetCredits("u1", 100)
 	p.SetCredits("u2", 200)
-
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			if strings.HasSuffix(r.URL.Path, upstream.EpChat) {
@@ -701,7 +702,8 @@ func TestSessionAffinityRouting(t *testing.T) {
 		t.Fatalf("req1 failed: %d", rec1.Code)
 	}
 
-	// 此时动态提升 u1 的积分为 999（大于 u2 的 200）
+	// 此时动态提升 u1 的积分为 999 —— 按规则②（积分最少优先），
+	// 无粘性时第二轮本应漂移到 u2(at2)
 	p.SetCredits("u1", 999)
 
 	// 轮次 2：相同对话流后续提问（带相同的首轮消息特征）
@@ -715,8 +717,10 @@ func TestSessionAffinityRouting(t *testing.T) {
 	if len(chatAuths) != 2 {
 		t.Fatalf("expected 2 chat requests, got %d", len(chatAuths))
 	}
-	// 验证第二轮由于会话特征指纹粘性，仍然锁定在初始选择的 at2 上，未跳跃至积分更高的 at1
-	if chatAuths[0] != "Cloud-IDE-JWT at2" || chatAuths[1] != "Cloud-IDE-JWT at2" {
-		t.Fatalf("affinity failed: got %v, expected both to be at2", chatAuths)
+	// 验证第二轮由于会话特征指纹粘性，仍锁定在首轮选中的账号上。
+	// 未探测过期 → 规则①打平 → 规则②「积分最少」→ 首轮选 u1(at1)；
+	// 第二轮 u1 被抬到 999 后若无知会漂移到 u2，粘性必须压住这个漂移。
+	if chatAuths[0] != "Cloud-IDE-JWT at1" || chatAuths[1] != "Cloud-IDE-JWT at1" {
+		t.Fatalf("affinity failed: got %v, expected both to be at1 (least credits on first pick)", chatAuths)
 	}
 }
