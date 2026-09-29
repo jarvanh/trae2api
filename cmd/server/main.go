@@ -73,6 +73,7 @@ func main() {
 		WorkMode:        upstream.WorkMode(cfg.WorkMode),
 		APIKey:          cfg.APIKey,
 		AuthDir:         cfg.AuthDir,
+		UsageDir:        cfg.UsageDir,
 		PlanCooldown:    cfg.PlanCreditDur,
 		SoftCooldown:    cfg.SoftRateDur,
 		ErrThreshold:    cfg.Cooldown.ErrThresh,

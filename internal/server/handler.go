@@ -28,6 +28,7 @@ type Config struct {
 	WorkMode        upstream.WorkMode
 	APIKey          string        // 空 = 不鉴权
 	AuthDir         string        // auths/ 目录，用于 import/delete 落盘 trae-*.json
+	UsageDir        string        // 用量明细目录（/app/data），空 = 不落盘
 	MaxRotate       int           // 单请求最多换号次数，默认 3
 	PlanCooldown    time.Duration // 1005 冷却，默认 12h
 	SoftCooldown    time.Duration // 429 冷却，默认 60s
@@ -503,6 +504,8 @@ func (h *Handler) executeWorkRequest(w http.ResponseWriter, r *http.Request, bod
 		if stream {
 			_ = upstream.StreamWorkToOpenAI(w, rc, model, "")
 			_ = rc.Close()
+			// Work 流式拿不到 token 明细，记 0/0 仅保留探测/真实分流计数
+			recordUsage(h.cfg.UsageDir, model, isProbeRequest(r), 0, 0)
 			return true, nil
 		}
 
@@ -513,6 +516,7 @@ func (h *Handler) executeWorkRequest(w http.ResponseWriter, r *http.Request, bod
 			h.cfg.Pool.NoteWorkError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
 			continue
 		}
+		recordUsage(h.cfg.UsageDir, model, isProbeRequest(r), promptTokens(resp), completionTokens(resp))
 		writeJSON(w, http.StatusOK, resp)
 		return true, nil
 	}
@@ -524,6 +528,8 @@ func (h *Handler) executeWorkRequest(w http.ResponseWriter, r *http.Request, bod
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+	// X-Probe 探测打标：1/true/yes 大小写不敏感即视为探测流量（模型测试/健康检查）
+	probe := isProbeRequest(r)
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
@@ -680,6 +686,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.toks = toks
 			}
 			st.ttfb = statsR.TTFB()
+			// 用量落盘：流式拿不到输入 tokens，记 completion 数（探测/真实分流足够）
+			recordUsage(h.cfg.UsageDir, peek.Model, probe, 0, max(st.toks, 0))
 			return
 		}
 		resp, err := upstream.Aggregate(rc)
@@ -706,6 +714,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.cfg.Pool.RecordSuccess(acct.UID)
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
+		recordUsage(h.cfg.UsageDir, peek.Model, probe, promptTokens(resp), max(st.toks, 0))
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}

@@ -17,6 +17,7 @@ type Config struct {
 	CallbackPort    string `json:"callback_port"`     // "18080"（TRAE 登录回调监听端口，0 = 不起）
 	APIKey          string `json:"-"`                 // 只读 env TW2A_API_KEY（不读 json）
 	AuthDir         string `json:"auth_dir"`          // "./auths"
+	UsageDir        string `json:"usage_dir"`         // "./data"（用量明细落盘目录，空 = 不落盘）
 	StateFile       string `json:"state_file"`        // "./data/state.json"
 	DefaultModel    string `json:"default_model"`     // "glm-5.2"
 	WorkMode        string `json:"work_mode"`         // "auto" | "native" | "bridge" | "disabled" (默认 auto)
@@ -108,6 +109,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("TW2A_STATE_FILE"); v != "" {
 		c.StateFile = v
+	}
+	if v := os.Getenv("TW2A_USAGE_DIR"); v != "" {
+		c.UsageDir = v
 	}
 	if v := os.Getenv("TW2A_DEFAULT_MODEL"); v != "" {
 		c.DefaultModel = v

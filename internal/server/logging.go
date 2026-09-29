@@ -171,6 +171,19 @@ func completionTokens(resp map[string]any) int {
 	return int(v)
 }
 
+// promptTokens 同上，提取 usage.prompt_tokens（用量记账用，缺失返回 -1 → recordUsage 钻 0）。
+func promptTokens(resp map[string]any) int {
+	u, ok := resp["usage"].(map[string]any)
+	if !ok {
+		return -1
+	}
+	v, ok := u["prompt_tokens"].(float64)
+	if !ok {
+		return -1
+	}
+	return int(v)
+}
+
 // uidPrefix 只显示 uid 前 8 位；空 uid 显示 "-"。
 func uidPrefix(uid string) string {
 	if uid == "" {
