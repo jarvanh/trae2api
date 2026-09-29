@@ -118,8 +118,9 @@ curl -X POST http://127.0.0.1:7864/v1/chat/completions \
 项目根目录下提供了便捷的 CLI 运维工具：
 
 ```bash
-# 全账号批量签到与 Token 保活
+# 全账号批量签到与 Token 保活（等价于 go run ./cmd/checkin）
 ./signin.sh
+./signin.sh /path/to/auths      # 指定 auths 目录，自动同探 data/state.json
 
 # 账号积分与使用情况报表
 ./credit.sh
@@ -130,6 +131,16 @@ curl -X POST http://127.0.0.1:7864/v1/chat/completions \
 # 查看指定 UID 账号
 ./credit.sh <UID>
 ```
+
+> ⚠️ 早期 `signin.sh` 引用了仓库里并不存在的 `cmd/signin`，必然失败；
+> 真正的签到器是 **`cmd/checkin`**（错峰排程 + 9074 自愈换代），脚本已于 2026-09-29 修正。
+
+### 签到与 9074（重要）
+
+签到失败若返回 **9074「当前参与用户太多」，这不是高峰拥堵，重试无效**。
+详见 [`docs/RESEARCH.md`](docs/RESEARCH.md) 的「§9074 真因与对策」章节：被风控的是
+请求里的 `X-Device-Id`；签到路径使用 UID 派生设备号并在命中 9074 时换代轮换。
+管理后台 `/admin`（`GET /admin/api/credits`）展示的签到状态与该路径同源。
 
 ## 配置项参考
 
