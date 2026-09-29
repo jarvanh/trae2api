@@ -21,6 +21,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -46,6 +47,8 @@ type result struct {
 	// PlannedAt 本轮未发真实请求时，预计下一次真实签到请求的东八区时刻
 	//（冷却结束 / 错峰排程到点，跨天带日期）。空串 = 本轮已有真实结果。
 	PlannedAt string `json:"planned_at,omitempty"`
+	// DeviceID 本轮实际使用的签到设备号（派生），便于排查设备侧风控
+	DeviceID string `json:"device_id,omitempty"`
 }
 
 type acctState struct {
@@ -212,18 +215,8 @@ func main() {
 		}
 
 		r := result{UID: j.uid, Nickname: a.Nickname}
-		checkedIn, _, enable, err := up.CheckinStatus(a)
-		if err != nil {
-			r.Err = fmt.Sprintf("checkin status: %v", err)
-		} else if !checkedIn && enable {
-			if err := up.CheckinClaim(a); err != nil {
-				r.Err = fmt.Sprintf("checkin claim: %v", err)
-			} else {
-				r.Claimed = true
-			}
-		} else {
-			r.CheckedIn = checkedIn
-		}
+		// 设备身份：UID 派生的签到专用号（9014 无关；见 checkinOnce 注释）
+		r.CheckedIn, r.Claimed, r.Err, r.DeviceID = checkinOnce(up, p, a, j.uid)
 		// 积分刷新 + 解冻（与调度器一致：无论签到成败都查一次用量）
 		remain, err := up.UserEntUsage(a)
 		if err != nil {
@@ -250,4 +243,54 @@ func main() {
 		_ = enc.Encode(r)
 	}
 	fmt.Fprintf(os.Stderr, "checkin done: %d/%d ok\n", ok, total)
+}
+
+// checkinOnce 对单账号执行一次签到，返回是否已签 / 本次是否领取 / 错误 / 实际使用的设备号。
+//
+// 设备号用 CheckinDeviceID 按 UID 派生，而不是 auth 文件里那个 deviceId。
+// 命中 9074 时换代后**立即重试一次** —— 实测这是真因解法：旧 deviceId 被风控
+// 标记后无论重试多少次都是 9074，换新派生号往往首发即中。
+func checkinOnce(up *upstream.Client, p *pool.Pool, a *auth.Auth, uid string) (checkedIn bool, claimed bool, errMsg string, deviceID string) {
+	identity := upstream.CheckinIdentity(a)
+	gen := p.CheckinGeneration(uid)
+
+	try := func(generation int) (bool, bool, error) {
+		devID := upstream.CheckinDeviceID(identity, generation)
+		deviceID = devID
+		ci, _, enable, err := up.CheckinStatus(a, devID)
+		if err != nil {
+			return false, false, err
+		}
+		if ci {
+			p.NoteCheckinChecked(uid)
+			return true, false, nil
+		}
+		if !enable {
+			return false, false, errors.New("checkin disabled")
+		}
+		if err := up.CheckinClaim(a, devID); err != nil {
+			return false, false, err
+		}
+		p.NoteCheckinChecked(uid)
+		return false, true, nil
+	}
+
+	ci, cl, err := try(gen)
+	if err == nil {
+		return ci, cl, "", deviceID
+	}
+	if !upstream.IsCheckinBusy(err) {
+		return false, false, fmt.Sprintf("checkin claim: %v", err), deviceID
+	}
+	// 9074 ＝ 设备号被标记 → 换代换号重试一次
+	next := p.BumpCheckinGeneration(uid)
+	fmt.Fprintf(os.Stderr, "uid=%s 9074 命中，设备换代 %d→%d 重试\n", uid, gen, next)
+	ci, cl, err2 := try(next)
+	if err2 != nil {
+		after := p.NoteCheckinRateLimited(uid)
+		fmt.Fprintf(os.Stderr, "uid=%s 换代后仍失败: %v（退避至 %s）\n", uid, err2, after.Format("15:04:05"))
+		return false, false, fmt.Sprintf("checkin claim: %v（已换代 %d）", err2, next), deviceID
+	}
+	fmt.Fprintf(os.Stderr, "uid=%s 换代后签到成功（gen=%d）\n", uid, next)
+	return ci, cl, "", deviceID
 }

@@ -5,6 +5,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"time"
 
@@ -87,6 +88,55 @@ func contains(hours []int, h int) bool {
 	return false
 }
 
+// checkinOne 对单账号执行签到（status → 未签则 claim）。
+//
+// 设备身份用 CheckinDeviceID 按 UID 派生，而不是 auth 文件里那个 deviceId：
+// 后者可能是批量导入时合成的，一旦被上游风控标记就恒定返回 9074
+// 「当前参与用户太多」，错峰重试再多次也签不成 —— 换代换新设备号才是解。
+// 命中 9074 时换代后**立即重试一次**（自愈），仍失败才退避等下一轮。
+func (s *Scheduler) checkinOne(uid string, a *auth.Auth) {
+	identity := upstream.CheckinIdentity(a)
+	gen := s.cfg.Pool.CheckinGeneration(uid)
+
+	try := func(generation int) error {
+		devID := upstream.CheckinDeviceID(identity, generation)
+		checkedIn, _, enable, err := s.cfg.Upstream.CheckinStatus(a, devID)
+		if err != nil {
+			return err
+		}
+		if checkedIn {
+			s.cfg.Pool.NoteCheckinChecked(uid)
+			log.Printf("checkin %s: already checked in", uid)
+			return nil
+		}
+		if !enable {
+			return fmt.Errorf("checkin disabled")
+		}
+		if err := s.cfg.Upstream.CheckinClaim(a, devID); err != nil {
+			return err
+		}
+		s.cfg.Pool.NoteCheckinChecked(uid)
+		log.Printf("checkin %s: ok", uid)
+		return nil
+	}
+
+	err := try(gen)
+	if err == nil {
+		return
+	}
+	if !upstream.IsCheckinBusy(err) {
+		log.Printf("checkin %s: %v", uid, err)
+		return
+	}
+	// 9074 ＝ 当前设备号被标记 → 换代换号重试一次
+	next := s.cfg.Pool.BumpCheckinGeneration(uid)
+	log.Printf("checkin %s: 9074 命中，设备换代 %d→%d 重试（旧错误: %v）", uid, gen, next, err)
+	if err2 := try(next); err2 != nil {
+		after := s.cfg.Pool.NoteCheckinRateLimited(uid)
+		log.Printf("checkin %s: 换代后仍失败 %v；退避至 %s", uid, err2, after.Format("15:04:05"))
+	}
+}
+
 // RunCheckinNow 立即对所有账号执行签到 + 积分刷新 + 解冻 + 过期探测。
 // 冷却中的账号也参与（签到就是为了解冻它们）；禁用的跳过。
 func (s *Scheduler) RunCheckinNow() {
@@ -98,19 +148,8 @@ func (s *Scheduler) RunCheckinNow() {
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
-		// 签到（status → 未签到则 claim）
-		checkedIn, _, enable, err := s.cfg.Upstream.CheckinStatus(a)
-		if err != nil {
-			log.Printf("checkin status %s: %v", st.UID, err)
-		} else if !checkedIn && enable {
-			if err := s.cfg.Upstream.CheckinClaim(a); err != nil {
-				log.Printf("checkin claim %s: %v", st.UID, err)
-			} else {
-				log.Printf("checkin %s: ok", st.UID)
-			}
-		} else if checkedIn {
-			log.Printf("checkin %s: already checked in", st.UID)
-		}
+		// 签到：设备号改用 UID 派生的签到专用号（见 checkinOne 注释）
+		s.checkinOne(st.UID, a)
 		// 查积分 + 解冻
 		remain, err := s.cfg.Upstream.UserEntUsage(a)
 		if err != nil {

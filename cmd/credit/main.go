@@ -79,7 +79,7 @@ func main() {
 				all = append(all, packRow{
 					UID: a.UID, Nickname: a.Nickname, Desc: p.Desc,
 					Limit: p.Limit, Used: p.Used, Remain: p.Limit - p.Used,
-					ExpireAt: p.ExpireAt,
+					ExpireAt:  p.ExpireAt,
 					ExpireFmt: time.Unix(p.ExpireAt, 0).In(cst).Format("2006-01-02 15:04"),
 				})
 			}
@@ -115,7 +115,8 @@ func main() {
 			continue
 		}
 		r := row{UID: a.UID, Nickname: a.Nickname}
-		checkedIn, credits, enable, err := up.CheckinStatus(a)
+		// 签到状态查询同样走派生设备号（与签到路径同源）
+		checkedIn, credits, enable, err := up.CheckinStatus(a, upstream.CheckinDeviceID(upstream.CheckinIdentity(a), 0))
 		if err != nil {
 			r.Err = err.Error()
 		} else {

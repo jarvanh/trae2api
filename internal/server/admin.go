@@ -65,7 +65,9 @@ func (h *Handler) adminCredits(w http.ResponseWriter, r *http.Request) {
 			} else {
 				ac.Remain, ac.Limit, ac.Used, ac.Packs = remain, limit, used, packs
 			}
-			checkedIn, credits, enable, cerr := h.cfg.Upstream.CheckinStatus(a)
+			// 面板展示用：设备号与签到路径同源（按当前代数派生）
+			checkinDeviceID := upstream.CheckinDeviceID(upstream.CheckinIdentity(a), h.cfg.Pool.CheckinGeneration(s.UID))
+			checkedIn, credits, enable, cerr := h.cfg.Upstream.CheckinStatus(a, checkinDeviceID)
 			if cerr != nil {
 				if ac.Error != "" {
 					ac.Error += "; "

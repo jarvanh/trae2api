@@ -252,12 +252,19 @@ func TestCheckinStatusAndClaim(t *testing.T) {
 	var path string
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		path = r.URL.Path
-		if r.Header.Get("X-User-Region") != "CN" {
-			return nil, errors.New("missing X-User-Region")
+		// 签到头必须极简（2026-09-29 实证成功形态）：派生设备号到位，
+		// 且不带旧 UgHeaders 的 UA / X-User-Region / X-Machine-Id。
+		if got := r.Header.Get("X-Device-Id"); got != "4302850041909017" {
+			return nil, errors.New("missing derived X-Device-Id, got " + got)
+		}
+		for _, h := range []string{"X-User-Region", "X-Machine-Id", "User-Agent"} {
+			if v := r.Header.Get(h); v != "" {
+				return nil, errors.New("unexpected header " + h)
+			}
 		}
 		return jsonResp(200, `{"checked_in":false,"credits":200,"enable":true}`), nil
 	})
-	checkedIn, credits, enable, err := c.CheckinStatus(&auth.Auth{AccessToken: "at"})
+	checkedIn, credits, enable, err := c.CheckinStatus(&auth.Auth{AccessToken: "at", UID: "u1"}, CheckinDeviceID("u1", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,5 +292,21 @@ func TestConsumptionRate(t *testing.T) {
 		if got := consumptionRate(c.raw); got != c.want {
 			t.Errorf("%s: consumptionRate(%q)=%v want %v", c.name, c.raw, got, c.want)
 		}
+	}
+}
+
+// TestCheckinClaimSurfacesBusy 签到业务码必须以结构化错误上浮，
+// 否则调用方无法区分「9074 换代」和「真的失败」。
+func TestCheckinClaimSurfacesBusy(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":9074,"message":"当前参与用户太多"}`), nil
+	})
+	err := c.CheckinClaim(&auth.Auth{AccessToken: "at"}, CheckinDeviceID("u1", 0))
+	if !IsCheckinBusy(err) {
+		t.Fatalf("9074 未判定为 busy: %v", err)
+	}
+	var ce *CheckinError
+	if !errors.As(err, &ce) || ce.Code != CheckinBusyCode {
+		t.Errorf("错误类型=%T code 提取失败: %v", err, err)
 	}
 }

@@ -1,10 +1,11 @@
-﻿// client.go SOLO 上游客户端：llm_utils_chat / get_detail_param / ExchangeToken /
+// client.go SOLO 上游客户端：llm_utils_chat / get_detail_param / ExchangeToken /
 // checkin_credits / ide_user_ent_usage + 错误分类。
 package upstream
 
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -57,6 +58,26 @@ type Error struct {
 
 func (e *Error) Error() string {
 	return fmt.Sprintf("upstream %s (http %d): %s", e.Kind, e.Status, e.Msg)
+}
+
+// CheckinError 签到接口 HTTP 200 但业务码非 0 的业务错误。
+// 9074「当前参与用户太多」= 当前设备号被风控标记，需换代换号而非硬重试。
+type CheckinError struct {
+	Code int
+	Msg  string
+}
+
+func (e *CheckinError) Error() string {
+	return fmt.Sprintf("%d %s", e.Code, e.Msg)
+}
+
+// IsCheckinBusy 判定错误是否为签到 9074 限流（设备号被标记）。
+func IsCheckinBusy(err error) bool {
+	var ce *CheckinError
+	if errors.As(err, &ce) {
+		return ce.Code == CheckinBusyCode
+	}
+	return false
 }
 
 var sessionDeadMarkers = []string{"login", "token 失效", "token invalid", "session", "unauthorized", "401"}
@@ -293,13 +314,13 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	}
 	var resp struct {
 		ConfigInfoList []struct {
-			ConfigName string `json:"config_name"`
+			ConfigName    string `json:"config_name"`
 			DisplayConfig struct {
 				DisplayName string `json:"display_name"`
 			} `json:"display_config"`
 			// 内嵌 JSON 字符串：consumption_rate.data.rate 即客户端显示的模型倍率（如 0.48x）
 			DisplayContactConfig string `json:"display_contact_config"`
-			ModelDetailList []struct {
+			ModelDetailList      []struct {
 				ModelName string `json:"model_name"`
 			} `json:"model_detail_list"`
 		} `json:"config_info_list"`
@@ -348,12 +369,14 @@ func consumptionRate(raw string) float64 {
 }
 
 // CheckinStatus 查询签到状态。
-func (c *Client) CheckinStatus(a *auth.Auth) (checkedIn bool, credits int64, enable bool, err error) {
+// deviceID 为签到专用派生设备号（空串时回退 auth 文件里的 DeviceID）；
+// 请求头走 CheckinHeaders 极简形态，与 UgHeaders（积分查询）区分。
+func (c *Client) CheckinStatus(a *auth.Auth, deviceID string) (checkedIn bool, credits int64, enable bool, err error) {
 	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinStatus, bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return false, 0, false, err
 	}
-	UgHeaders(req, a)
+	CheckinHeaders(req, a, deviceID)
 	data, err := c.doJSON(req)
 	if err != nil {
 		return false, 0, false, err
@@ -369,13 +392,14 @@ func (c *Client) CheckinStatus(a *auth.Auth) (checkedIn bool, credits int64, ena
 	return resp.CheckedIn, resp.Credits, resp.Enable, nil
 }
 
-// CheckinClaim 执行签到。
-func (c *Client) CheckinClaim(a *auth.Auth) error {
+// CheckinClaim 执行签到。deviceID 语义同 CheckinStatus。
+// HTTP 200 但业务码非 0 时返回 *CheckinError，供调用方判定 9074 限流。
+func (c *Client) CheckinClaim(a *auth.Auth, deviceID string) error {
 	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinClaim, bytes.NewReader([]byte("{\"req_source\":2}")))
 	if err != nil {
 		return err
 	}
-	UgHeaders(req, a)
+	CheckinHeaders(req, a, deviceID)
 	data, err := c.doJSON(req)
 	if err != nil {
 		return err
@@ -385,7 +409,7 @@ func (c *Client) CheckinClaim(a *auth.Auth) error {
 		Message string `json:"message"`
 	}
 	if err := json.Unmarshal(data, &resp); err == nil && resp.Code != 0 {
-		return fmt.Errorf("%d %s", resp.Code, resp.Message)
+		return &CheckinError{Code: resp.Code, Msg: resp.Message}
 	}
 	return nil
 }

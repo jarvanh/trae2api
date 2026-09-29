@@ -87,6 +87,12 @@ type entry struct {
 	errCount      int
 	workErrCount  int
 
+	// 签到设备轮换代数与 9074 退避状态（持久化于 state.json，跨重启生效）。
+	// 代数只增不减：被风控标记的设备号一旦弃用就不再回头。
+	checkinGen        int
+	checkinRetryAfter time.Time
+	checkinRetryCount int
+
 	// 运行态在途租约与三因子统计
 	inFlight     int
 	lastUsed     time.Time
@@ -126,6 +132,10 @@ type stateEntry struct {
 	Until       time.Time `json:"until,omitempty"`
 	WorkReason  string    `json:"work_reason,omitempty"`
 	WorkUntil   time.Time `json:"work_until,omitempty"`
+	// 签到设备轮换代数与 9074 退避状态；旧文件缺省为 0 / 零值（基线设备号）。
+	CheckinGen        int       `json:"checkin_device_gen,omitempty"`
+	CheckinRetryAfter time.Time `json:"checkin_retry_after,omitempty"`
+	CheckinRetryCount int       `json:"checkin_retry_count,omitempty"`
 }
 
 // stateFile 持久化格式。
@@ -774,15 +784,18 @@ func (p *Pool) load() {
 			wc = *s.WorkCredits
 		}
 		p.byUID[uid] = &entry{
-			a:           &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
-			credits:     s.Credits,
-			workCredits: wc,
-			disabled:    s.Disabled,
-			enabled:     enabled,
-			reason:      s.Reason,
-			until:       s.Until,
-			workReason:  s.WorkReason,
-			workUntil:   s.WorkUntil,
+			a:                 &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
+			credits:           s.Credits,
+			workCredits:       wc,
+			disabled:          s.Disabled,
+			enabled:           enabled,
+			reason:            s.Reason,
+			until:             s.Until,
+			workReason:        s.WorkReason,
+			workUntil:         s.WorkUntil,
+			checkinGen:        s.CheckinGen,
+			checkinRetryAfter: s.CheckinRetryAfter,
+			checkinRetryCount: s.CheckinRetryCount,
 		}
 	}
 }
@@ -794,12 +807,15 @@ func (p *Pool) saveLocked() {
 	sf := stateFile{Accounts: map[string]stateEntry{}}
 	for uid, e := range p.byUID {
 		se := stateEntry{
-			Credits:    e.credits,
-			Disabled:   e.disabled,
-			Reason:     e.reason,
-			Until:      e.until,
-			WorkReason: e.workReason,
-			WorkUntil:  e.workUntil,
+			Credits:           e.credits,
+			Disabled:          e.disabled,
+			Reason:            e.reason,
+			Until:             e.until,
+			WorkReason:        e.workReason,
+			WorkUntil:         e.workUntil,
+			CheckinGen:        e.checkinGen,
+			CheckinRetryAfter: e.checkinRetryAfter,
+			CheckinRetryCount: e.checkinRetryCount,
 		}
 		if e.workCredits > 0 {
 			wc := e.workCredits
@@ -824,4 +840,95 @@ func (p *Pool) saveLocked() {
 		return
 	}
 	_ = os.Rename(tmp, p.stateFp)
+}
+
+// ---------------------------------------------------------------------------
+// 签到设备轮换（9074 自愈）
+//
+// 9074「当前参与用户太多」实为设备号被风控标记（2026-09-29 实测）：
+// auths 里合成的 deviceId 恒定被拒，换按 UID 派生的设备号后连败 32 / 37 次的
+// 账号首发即中。因此 9074 的处理不是等待重试，而是**换代换设备号**。
+// 代数只增不减，持久化于 state.json；退避用 wall-clock，重启不丢。
+// Source: 240xu/trae2api-more ← autumnsentiment/Trae2api-cn @ c698b19
+// ---------------------------------------------------------------------------
+
+const (
+	checkinRetryBase    = time.Minute // 60s 起步
+	checkinRetryExpCap  = 3           // 左移上限 → 480s 封顶
+	checkinRetryMaxBack = time.Hour
+)
+
+// checkinBackoff 返回第 count 次 9074 后的等待时长（count 从 0 起）：
+// 60s → 120s → 240s → 480s → … 封顶 480s。
+func checkinBackoff(count int) time.Duration {
+	shift := count
+	if shift > checkinRetryExpCap {
+		shift = checkinRetryExpCap
+	}
+	d := checkinRetryBase << shift
+	if d > checkinRetryMaxBack {
+		d = checkinRetryMaxBack
+	}
+	return d
+}
+
+// CheckinGeneration 返回账号当前签到设备轮换代数（未轮换过为 0）。
+func (p *Pool) CheckinGeneration(uid string) int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if e, ok := p.byUID[uid]; ok {
+		return e.checkinGen
+	}
+	return 0
+}
+
+// BumpCheckinGeneration 9074 后把换代 +1 并持久化，返回新代数。
+// 下轮签到用新代数派生出全新的设备号。
+func (p *Pool) BumpCheckinGeneration(uid string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return 0
+	}
+	e.checkinGen++
+	p.saveLocked()
+	return e.checkinGen
+}
+
+// NoteCheckinRateLimited 记录一次 9074，返回可重试时刻（退避递增）。
+func (p *Pool) NoteCheckinRateLimited(uid string) time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return time.Time{}
+	}
+	after := time.Now().Add(checkinBackoff(e.checkinRetryCount))
+	e.checkinRetryAfter = after
+	e.checkinRetryCount++
+	p.saveLocked()
+	return after
+}
+
+// CheckinRetryAfter 返回 9074 退避截止时刻（零值表示不在退避窗口内）。
+func (p *Pool) CheckinRetryAfter(uid string) time.Time {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if e, ok := p.byUID[uid]; ok {
+		return e.checkinRetryAfter
+	}
+	return time.Time{}
+}
+
+// NoteCheckinChecked 签到成功或今日已签：清退避计数，**保留代数**
+// （当前设备号既然可用就用下去，只在被标记时才换代）。
+func (p *Pool) NoteCheckinChecked(uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		e.checkinRetryAfter = time.Time{}
+		e.checkinRetryCount = 0
+	}
+	p.saveLocked()
 }
