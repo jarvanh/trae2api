@@ -416,6 +416,8 @@ function fmtDur(ms){
 }
 
 let usageRows = [];
+let usageNicks = {};   // uid → 昵称（后端给，不额外打上游）
+let usageRates = {};  // model → 消耗倍率（与「模型与倍率」tab 同源）
 async function loadUsage(){
   const box = document.getElementById('usageTable');
   const meta = document.getElementById('usageMeta');
@@ -429,6 +431,8 @@ async function loadUsage(){
     const d = await r.json();
     if(!r.ok){ box.innerHTML = '<div style="color:var(--bad)">加载失败：'+esc(apiErr(d))+'</div>'; return; }
     usageRows = d.entries || [];
+    usageNicks = d.nicknames || {};
+    usageRates = d.rates || {};
     renderUsageSummary(d);
     renderUsageTable();
     meta.textContent = '数据源 '+esc(d.usage_dir||'-')+'/usage-'+esc(d.date)+'.jsonl · '+(d.fetched_at||'');
@@ -485,12 +489,24 @@ function renderUsageTable(){
     const probeTag = e.probe ? ' <span class="badge b-dim">探测</span>' : '';
     const modeTag = e.mode ? '<span class="badge b-dim">'+esc(e.mode)+'</span>' : '';
     const tok = (e.in||e.out) ? (fmt(e.in||0)+' / '+fmt(e.out||0)) : '-';
-    const uid = e.uid ? '<span class="mono">'+esc(String(e.uid).slice(0,8))+'</span>' : '-';
+    // 账号列：昵称优先（人话），无昵称退回 uid 后 6 位；鼠标悬停给完整 uid
+    const nick = e.uid ? (usageNicks[e.uid] || '') : '';
+    const uidCell = e.uid
+      ? '<span title="'+esc(e.uid)+'">'+esc(nick || '…'+String(e.uid).slice(-6))
+        + (nick ? ' <span class="mono" style="color:var(--dim)">…'+esc(String(e.uid).slice(-6))+'</span>' : '')
+        + '</span>'
+      : '-';
+    // 倍率列：0.78x 着色省/贵，上游没给就是「未知」—— 绝不编造数字
+    const rt = e.model ? usageRates[e.model] : 0;
+    const rateCell = rt > 0
+      ? '<span class="badge '+(rt<=0.5?'b-ok':(rt>1?'b-warn':'b-dim'))+'">'+rt.toFixed(2)+'x</span>'
+      : '<span class="badge b-dim">未知</span>';
     const err = e.err ? '<div class="mono" style="color:var(--bad);margin-top:4px">'+esc(e.err)+'</div>' : '';
     return '<tr>'
       + '<td class="mono">'+esc(fmtTime(e.t))+'</td>'
       + '<td class="mono">'+esc(e.model||'-')+'</td>'
-      + '<td>'+uid+'</td>'
+      + '<td>'+uidCell+'</td>'
+      + '<td>'+rateCell+'</td>'
       + '<td><span class="badge '+stCls+'">'+esc(stTxt)+'</span>'+probeTag+'</td>'
       + '<td>'+modeTag+'</td>'
       + '<td class="mono">'+fmtDur(e.ms)+'</td>'
@@ -502,7 +518,8 @@ function renderUsageTable(){
   box.innerHTML = '<table class="accts"><thead><tr>'
     + '<th style="width:96px">时间</th>'
     + '<th>模型</th>'
-    + '<th style="width:110px">账号</th>'
+    + '<th style="width:120px">账号</th>'
+    + '<th style="width:90px">倍率</th>'
     + '<th style="width:110px">状态</th>'
     + '<th style="width:100px">通道</th>'
     + '<th style="width:80px">耗时</th>'

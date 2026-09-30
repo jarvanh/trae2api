@@ -372,6 +372,24 @@ func (h *Handler) adminUsage(w http.ResponseWriter, r *http.Request) {
 	if entries == nil {
 		entries = []usageEntry{}
 	}
+
+	// 昵称映射 uid→nickname：流水里存的 uid 是纯数字，面板要显示成人话。
+	// 直接读池内状态（已在内存），不额外打上游。
+	nicknames := map[string]string{}
+	for _, s := range h.cfg.Pool.List() {
+		if s.Nickname != "" {
+			nicknames[s.UID] = s.Nickname
+		}
+	}
+	// 倍率映射 model→consumption_rate：与「模型与倍率」tab 同源（fetchDynamicModels），
+	// 命中 1h 缓存时不产生任何上游请求；上游失败为空 map，前端显示「未知」。
+	rates := map[string]float64{}
+	for _, mi := range h.fetchDynamicModels() {
+		if mi.Rate > 0 {
+			rates[mi.ID] = mi.Rate
+		}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"date":       date,
 		"fetched_at": time.Now().In(beijing).Format("2006-01-02 15:04:05"),
@@ -379,6 +397,8 @@ func (h *Handler) adminUsage(w http.ResponseWriter, r *http.Request) {
 		"agg":        agg,
 		"warn":       warn,
 		"usage_dir":  h.cfg.UsageDir,
+		"nicknames":  nicknames,
+		"rates":      rates,
 	})
 }
 
