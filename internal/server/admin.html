@@ -52,6 +52,14 @@
   .meta { color:var(--dim); font-size:12px; display:flex; gap:14px; flex-wrap:wrap; }
   .meta b { color:var(--fg); font-weight:600; }
   .errline { margin-top:10px; color:var(--bad); font-size:12px; word-break:break-all; }
+  /* 权益包明细（含过期时间） */
+  .packs { margin-top:10px; border-top:1px solid #232836; padding-top:10px; display:flex; flex-direction:column; gap:6px; }
+  .pack { display:flex; gap:10px; align-items:baseline; font-size:12px; color:var(--dim); }
+  .pack .pdesc { flex:1; color:var(--fg); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .pack .pnum { font-variant-numeric:tabular-nums; }
+  .pack .pexp { font-variant-numeric:tabular-nums; }
+  .pack.urgent .pexp { color:var(--bad); font-weight:600; }
+  .pack.soon .pexp { color:var(--warn); }
   /* accounts table */
   table.accts { width:100%; border-collapse:collapse; font-size:13px; }
   table.accts th, table.accts td { text-align:left; padding:10px 12px; border-bottom:1px solid #232836; }
@@ -331,6 +339,21 @@ function pollLogin(pid){
 }
 
 /* ─── 额度监控（原卡片视图，保留） ─── */
+// packsLine 渲染权益包明细：只展示未用完包里最早过期的若干个，
+// 7 天内到期标红、30 天内标黄 —— 与 TG 通知的临期口径保持一致。
+function packsLine(a){
+  if(a.error || !a.packs_detail || !a.packs_detail.length) return '';
+  return '<div class="packs">' + a.packs_detail.map(p=>{
+    const d = p.days_left;
+    const cls = d<=7 ? 'urgent' : (d<=30 ? 'soon' : '');
+    return '<div class="pack '+cls+'">'
+      + '<span class="pdesc">'+esc(p.desc||'权益包')+'</span>'
+      + '<span class="pnum">'+fmt(p.remain)+' / '+fmt(p.limit)+'</span>'
+      + '<span class="pexp">'+(p.expire_fmt||'-')+(d>=0 ? ' · 剩 '+d+' 天' : '')+'</span>'
+      + '</div>';
+  }).join('') + '</div>';
+}
+
 function renderCredits(d){
   const grid = document.getElementById('grid');
   if(!d.accounts || d.accounts.length===0){
@@ -346,6 +369,9 @@ function renderCredits(d){
       if(a.cooling) badges += badge('冷却中','b-warn');
       if(a.disabled) badges += badge('已禁用','b-bad');
       if(a.packs>0) badges += badge(a.packs+' 权益包','b-dim');
+      // 最早到期的未用完包：临期预警（nearest_days=-1 表示没有未用完的包）
+      if(a.nearest_days>=0 && a.nearest_days<=0) badges += badge('今日过期','b-bad');
+      else if(a.nearest_days>0 && a.nearest_days<=7) badges += badge(a.nearest_days+' 天后过期','b-warn');
     }
     const remainLine = a.error ? '<div style="color:var(--bad);font-size:14px">额度查询失败</div>'
       : '<div class="remain">'+fmt(a.remain)+'<span>积分剩余</span></div>';
@@ -356,6 +382,7 @@ function renderCredits(d){
       + '<div class="card-top"><div><div class="nick">'+esc(a.nickname||'(未命名)')+'</div>'
       + '<div class="uid">'+esc(a.uid)+'</div></div><div class="badges">'+badges+'</div></div>'
       + remainLine + meta
+      + packsLine(a)
       + (a.error ? '<div class="errline">'+esc(a.error)+'</div>' : '')
       + '</div>';
   }).join('');
