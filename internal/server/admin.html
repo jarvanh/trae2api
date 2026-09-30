@@ -68,6 +68,15 @@
   table.accts .mono { font-family:Consolas,monospace; font-size:11px; color:var(--dim); }
   .sortable { cursor:pointer; user-select:none; }
   .sortable:hover { color:var(--fg); }
+  /* 拖动排序 */
+  [draggable="true"] { cursor:grab; }
+  [draggable="true"].dragging { opacity:.4; cursor:grabbing; }
+  [draggable="true"].dragover-top { box-shadow: inset 0 3px 0 var(--accent); }
+  [draggable="true"].dragover-bottom { box-shadow: inset 0 -3px 0 var(--accent); }
+  .orderbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+    margin-bottom:10px; font-size:12px; color:var(--dim); }
+  .orderbar .btn.sm { padding:4px 10px; font-size:12px; }
+  .orderbar .hint { color:var(--dim); }
   .row-actions { display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; }
   .toggle { position:relative; display:inline-block; width:38px; height:20px; }
   .toggle input { opacity:0; width:0; height:0; }
@@ -139,6 +148,10 @@
       </div>
     </div>
 
+    <div class="orderbar">
+      <span>拖动行可调整顺序（自动保存，仅影响控制台展示，不改变选号规则）</span>
+      <button class="btn sm" onclick="resetOrder()">重置为默认顺序</button>
+    </div>
     <div id="acctTable"><div style="color:var(--dim)"><span class="spin"></span> 加载中...</div></div>
   </div>
 
@@ -152,6 +165,13 @@
     <div class="login-bar" style="margin-bottom:12px">
       <h2>模型列表与消耗倍率</h2>
       <span id="modelsMeta" style="font-size:12px;color:var(--dim)"></span>
+    </div>
+    <div class="orderbar">
+      <span>拖动行可调整顺序（自动保存）</span>
+      <button class="btn sm" onclick="toggleInternal()">显示内部/占位模型</button>
+      <button class="btn sm" onclick="setModelSort('rate')">按倍率排序</button>
+      <button class="btn sm" onclick="resetOrder()">重置为默认顺序</button>
+      <span class="hint">默认隐藏 custom_model_* / *_subagent / summary 等内部配置</span>
     </div>
     <div id="modelTable"><div style="color:var(--dim)"><span class="spin"></span> 加载中...</div></div>
   </div>
@@ -173,6 +193,111 @@ let loginPollTimer = null;
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function badge(text, cls){ return '<span class="badge '+cls+'">'+esc(text)+'</span>'; }
 function fmt(n){ return (n==null?'-':Number(n).toLocaleString()); }
+
+/* ─── 拖动排序（三个 tab 共用）───
+   仅改变**控制台展示顺序**，落 /app/data/admin-order.json（随 Dropbox 持久化）；
+   不影响 pool 选号逻辑（选号仍按权益包过期/剩余积分规则序）。 */
+let acctOrder = [];      // 账号 uid 顺序
+let modelOrder = [];     // 模型 ID 顺序
+let dragSrc = null;      // 正在拖动的元素
+
+function dragStart(e, el){ dragSrc = el; el.classList.add('dragging'); e.dataTransfer.effectAllowed='move'; }
+function dragEnd(el){ if(el) el.classList.remove('dragging'); document.querySelectorAll('.dragover-top,.dragover-bottom')
+  .forEach(x=>x.classList.remove('dragover-top','dragover-bottom')); dragSrc=null; }
+function dragOverRow(e, el){
+  e.preventDefault();
+  if(!dragSrc || dragSrc===el) return;
+  const r = el.getBoundingClientRect();
+  const after = (e.clientY - r.top) > r.height/2;
+  el.classList.toggle('dragover-bottom', after);
+  el.classList.toggle('dragover-top', !after);
+}
+function dragLeaveRow(el){ el.classList.remove('dragover-top','dragover-bottom'); }
+// dropRow 把 dragSrc 移动到目标 el 的前/后，回调 onReorder(newIdArray)
+function dropRow(e, el, ids, onReorder){
+  e.preventDefault();
+  el.classList.remove('dragover-top','dragover-bottom');
+  if(!dragSrc || dragSrc===el) return;
+  const r = el.getBoundingClientRect();
+  const after = (e.clientY - r.top) > r.height/2;
+  const fromId = dragSrc.dataset.id, toId = el.dataset.id;
+  const from = ids.indexOf(fromId);
+  if(from < 0) return;
+  ids.splice(from, 1);
+  let to = ids.indexOf(toId);
+  if(after) to += 1;
+  ids.splice(to, 0, fromId);
+  dragEnd(dragSrc);
+  onReorder(ids);
+}
+
+// bySavedOrder 按已保存顺序重排列表；未在 order 里的保持原相对序追加在后。
+function bySavedOrder(list, order, keyFn){
+  if(!order || !order.length) return list;
+  const pos = new Map(); order.forEach((id,i)=>pos.set(id,i));
+  return list.slice().sort((x,y)=>{
+    const px = pos.has(keyFn(x)) ? pos.get(keyFn(x)) : 1e9;
+    const py = pos.has(keyFn(y)) ? pos.get(keyFn(y)) : 1e9;
+    return px - py;
+  });
+}
+let lastAccts = [], lastCreditAccts = [];
+
+// 三个 tab 的拖动回调：改顺序 → 落盘 → 重渲染
+async function applyAcctOrder(ids){
+  acctOrder = ids; lastAccts = bySavedOrder(lastAccts, acctOrder, a=>a.uid);
+  if(await saveOrder()) renderAccounts(lastAccts);
+}
+async function applyCreditOrder(ids){
+  acctOrder = ids; lastCreditAccts = bySavedOrder(lastCreditAccts, acctOrder, a=>a.uid);
+  if(await saveOrder()) renderCredits({accounts: lastCreditAccts});
+}
+async function applyModelOrder(ids){
+  modelOrder = ids; modelRows = bySavedOrder(modelRows, modelOrder, m=>m.id);
+  modelSort = {key:'custom', dir:1};   // 切到自定义序，避免被其余排序覆盖
+  if(await saveOrder()) renderModelTable();
+}
+async function resetOrder(){
+  if(!confirm('重置为默认顺序？（会清除已保存的拖动排序）')) return;
+  acctOrder = []; modelOrder = [];
+  await saveOrder();
+  loadAccounts(); loadModels(); loadCredits();
+}
+// 拖动属性串（三处共用）
+// curAcctIds / curCreditIds / curModelIds = **当前实际渲染顺序**的 ID 数组，
+// 由各 render 函数刷新。拖拽必须以它为数据源：首次进入时保存的 order 可能为空，
+// 若拿空数组当源，indexOf 找不到元素会让拖拽静默失效。
+let curAcctIds = [], curCreditIds = [], curModelIds = [];
+// 首次进入页面时拉取已保存顺序（拖动排序的结果），之后 render 才会按它排
+async function loadUIOrder(){
+  try{
+    const r = await fetch('/admin/api/order', {cache:'no-store'});
+    if(!r.ok) return;
+    const o = await r.json();
+    acctOrder = o.accounts || [];
+    modelOrder = o.models || [];
+  }catch(e){ /* 忽略：无保存顺序则用默认序 */ }
+}
+function dragAttrs(id, idsVar, applyFn){
+  return ' draggable="true" data-id="'+esc(id)+'"'
+    + ' ondragstart="dragStart(event,this)" ondragover="dragOverRow(event,this)"'
+    + ' ondragleave="dragLeaveRow(this)" ondrop="dropRow(event,this,'+idsVar+','+applyFn+')"'
+    + ' ondragend="dragEnd(this)"';
+}
+
+async function saveOrder(){
+  const r = await fetch('/admin/api/order', {
+    method:'POST',
+    headers:{'Content-Type':'application/json', ...authHeader()},
+    body: JSON.stringify({accounts: acctOrder, models: modelOrder})
+  });
+  if(!r.ok){
+    const e = await r.json().catch(()=>({}));
+    alert('保存顺序失败：'+apiErr(e));
+    return false;
+  }
+  return true;
+}
 function authHeader(){
   const k = getKey();
   return k ? { 'Authorization': 'Bearer ' + k } : {};
@@ -223,7 +348,11 @@ function renderModelTable(){
   const box = document.getElementById('modelTable');
   if(!modelRows.length){ box.innerHTML = '<div style="color:var(--dim)">无模型数据</div>'; return; }
   const key = modelSort.key, dir = modelSort.dir;
-  const rows = modelRows.slice().sort((a,b)=>{
+  let rows;
+  if(key==='custom'){
+    // 拖动后的自定义顺序（落盘在 /app/data/admin-order.json）
+    rows = bySavedOrder(modelRows, modelOrder, m=>m.id);
+  } else rows = modelRows.slice().sort((a,b)=>{
     if(key==='rate'){
       const ra=a.consumption_rate||0, rb=b.consumption_rate||0;
       // 倍率未知(0)恒定沉底，不随升降序翻转 —— 否则未知会霸占顶部误导
@@ -234,6 +363,7 @@ function renderModelTable(){
     if(key==='ctx') return ((a.context_length||0)-(b.context_length||0))*dir;
     return String(a.id).localeCompare(String(b.id))*dir;
   });
+  curModelIds = rows.map(m=>m.id);
   const arrow = k => modelSort.key===k ? (modelSort.dir>0?' \u25b2':' \u25bc') : '';
   box.innerHTML = '<table class="accts"><thead><tr>'
     + '<th class="sortable" onclick="setModelSort(\'id\')">模型 ID'+arrow('id')+'</th>'
@@ -244,18 +374,24 @@ function renderModelTable(){
         const rate = m.consumption_rate;
         const cls = rate>0 ? (rate<=0.5?'b-ok':(rate>1?'b-warn':'b-dim')) : 'b-dim';
         const txt = rate>0 ? rate.toFixed(2)+'x' : '未知';
-        return '<tr><td class="mono">'+esc(m.id)+'</td>'
+        return '<tr'+dragAttrs(m.id, 'curModelIds', 'applyModelOrder')+'><td class="mono">'+esc(m.id)+'</td>'
           + '<td>'+fmt(m.context_length)+'</td>'
           + '<td><span class="badge '+cls+'">'+esc(txt)+'</span></td></tr>';
       }).join('')
     + '</tbody></table>';
 }
 
+let showInternal = false;
+function toggleInternal(){
+  showInternal = !showInternal;
+  loadModels();
+}
+
 async function loadModels(){
   const box = document.getElementById('modelTable');
   const meta = document.getElementById('modelsMeta');
   try{
-    const r = await fetch('/admin/api/models', {cache:'no-store'});
+    const r = await fetch('/admin/api/models'+(showInternal?'?all=1':''), {cache:'no-store'});
     const d = await r.json();
     modelRows = d.models || [];
     meta.textContent = (d.dynamic ? '实时表' : '静态回退表（上游不可用）')
@@ -284,7 +420,23 @@ function renderAccounts(accts){
     el.innerHTML = '<div style="color:var(--dim);padding:14px">暂无账号，点上方「添加账号」登录，或粘贴回调链接导入。</div>';
     return;
   }
-  let rows = accts.map(a=>{
+  lastAccts = accts;
+  let list = bySavedOrder(accts, acctOrder, a=>a.uid);
+  if(acctSort.key){
+    list = list.slice().sort((x,y)=>{
+      let vx, vy;
+      switch(acctSort.key){
+        case 'credits': vx=x.credits||0; vy=y.credits||0; break;
+        case 'exp':     vx=x.expires_at||0; vy=y.expires_at||0; break;
+        case 'status':  vx=(x.disabled?2:(!x.enabled?1:(x.cooling?0:-1)));
+                        vy=(y.disabled?2:(!y.enabled?1:(y.cooling?0:-1))); break;
+        default:        return String(x.nickname||'').localeCompare(String(y.nickname||''))*acctSort.dir;
+      }
+      return (vx-vy)*acctSort.dir;
+    });
+  }
+  curAcctIds = list.map(a=>a.uid);
+  let rows = list.map(a=>{
     let badges = '';
     if(a.disabled) badges += badge('禁用(session dead)','b-bad');
     else if(!a.enabled) badges += badge('已停用','b-warn');
@@ -294,7 +446,7 @@ function renderAccounts(accts){
     const exp = a.expires_at ? new Date(a.expires_at*1000).toLocaleString() : '-';
     const toggleChecked = a.enabled && !a.disabled ? 'checked' : '';
     const toggleDisabled = a.disabled ? 'disabled' : '';
-    return '<tr>'
+    return '<tr'+dragAttrs(a.uid, 'curAcctIds', 'applyAcctOrder')+'>'
       + '<td><div class="nick">'+esc(a.nickname||'(未命名)')+'</div>'
       + '<div class="uid mono">'+esc(a.uid)+'</div></td>'
       + '<td>'+badges+(a.reason?'<div class="mono" style="margin-top:4px">'+esc(a.reason)+'</div>':'')+'</td>'
@@ -309,10 +461,22 @@ function renderAccounts(accts){
       + '</div></td>'
       + '</tr>';
   }).join('');
+  const ar = k => acctSort.key===k ? (acctSort.dir>0?' \u25b2':' \u25bc') : '';
   el.innerHTML = '<table class="accts"><thead><tr>'
-    + '<th>账号</th><th>状态</th><th>积分</th><th>Token 有效期</th><th>机器/设备(前8)</th><th style="text-align:right">操作</th>'
+    + '<th class="sortable" onclick="setAcctSort(\'nick\')">账号'+ar('nick')+'</th>'
+    + '<th class="sortable" onclick="setAcctSort(\'status\')">状态'+ar('status')+'</th>'
+    + '<th class="sortable" onclick="setAcctSort(\'credits\')">积分'+ar('credits')+'</th>'
+    + '<th class="sortable" onclick="setAcctSort(\'exp\')">Token 有效期'+ar('exp')+'</th>'
+    + '<th>机器/设备(前8)</th><th style="text-align:right">操作</th>'
     + '</tr></thead><tbody>'+rows+'</tbody></table>';
 }
+let acctSort = {key:'', dir:1};   // 空 = 按拖动/默认顺序
+function setAcctSort(key){
+  if(acctSort.key===key) acctSort.dir = -acctSort.dir;
+  else acctSort = {key:key, dir:1};
+  renderAccounts(lastAccts);
+}
+
 async function toggleAcct(uid, enabled){
   const r = await fetch('/admin/api/accounts/'+encodeURIComponent(uid), {
     method:'PATCH', headers:{'Content-Type':'application/json', ...authHeader()},
@@ -428,13 +592,37 @@ function packsLine(a){
   }).join('') + '</div>';
 }
 
+let creditSort = {key:'', dir:1};   // 空 = 按拖动/默认顺序
+function setCreditSort(key){
+  if(creditSort.key===key) creditSort.dir = -creditSort.dir;
+  else creditSort = {key:key, dir:1};
+  renderCredits({accounts: lastCreditAccts});
+}
+
 function renderCredits(d){
   const grid = document.getElementById('grid');
   if(!d.accounts || d.accounts.length===0){
     grid.innerHTML = '<div style="color:var(--dim)">暂无账号</div>';
     return;
   }
-  grid.innerHTML = d.accounts.map(a=>{
+  lastCreditAccts = d.accounts;
+  let list = bySavedOrder(d.accounts, acctOrder, a=>a.uid);
+  if(creditSort.key){
+    list = list.slice().sort((x,y)=>{
+      let vx, vy;
+      switch(creditSort.key){
+        case 'remain':  vx=x.remain||0; vy=y.remain||0; break;
+        case 'days':    // 临期优先（nearest_days=-1 表示没有未用完包 → 排最后）
+                        vx=(x.nearest_days<0?1e9:x.nearest_days);
+                        vy=(y.nearest_days<0?1e9:y.nearest_days); break;
+        case 'checkin': vx=(x.checked_in?0:1); vy=(y.checked_in?0:1); break;
+        default:        return String(x.nickname||'').localeCompare(String(y.nickname||''))*creditSort.dir;
+      }
+      return (vx-vy)*creditSort.dir;
+    });
+  }
+  curCreditIds = list.map(a=>a.uid);
+  grid.innerHTML = list.map(a=>{
     let badges = '';
     if(a.error) badges += badge('查询失败','b-bad');
     else {
@@ -452,7 +640,7 @@ function renderCredits(d){
     const meta = a.error ? '' :
       '<div class="meta"><span>总量 <b>'+fmt(a.limit)+'</b></span><span>已用 <b>'+fmt(a.used)+'</b></span>'+
       (a.checkin_enable ? '<span>今日可领 <b>'+fmt(a.checkin_credits)+'</b></span>' : '')+'</div>';
-    return '<div class="card'+(a.error?' err':'')+'">'
+    return '<div class="card'+(a.error?' err':'')+'"'+dragAttrs(a.uid, 'curCreditIds', 'applyCreditOrder')+'>'
       + '<div class="card-top"><div><div class="nick">'+esc(a.nickname||'(未命名)')+'</div>'
       + '<div class="uid">'+esc(a.uid)+'</div></div><div class="badges">'+badges+'</div></div>'
       + remainLine + meta
@@ -470,8 +658,11 @@ async function loadCredits(){
   }
 }
 
-/* 初始 */
-loadAccounts();
+/* 初始：先取已保存顺序，再渲染，否则拖动排序刷新后会丢 */
+(async function init(){
+  await loadUIOrder();
+  loadAccounts();
+})();
 </script>
 </body>
 </html>

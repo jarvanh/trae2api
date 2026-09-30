@@ -104,6 +104,9 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /admin", h.adminPage)
 	h.mux.HandleFunc("GET /admin/api/credits", h.adminCredits)
 	h.mux.HandleFunc("GET /admin/api/models", h.adminModels)
+	// 控制台拖动排序：GET 读已保存顺序，POST 保存（写操作需 Bearer = TW2A_API_KEY）
+	h.mux.HandleFunc("GET /admin/api/order", h.adminGetOrder)
+	h.mux.HandleFunc("POST /admin/api/order", h.withAdminAuth(h.adminSaveOrder))
 	// 账号 CRUD
 	h.mux.HandleFunc("GET /admin/api/accounts", h.adminAccounts)
 	h.mux.HandleFunc("POST /admin/api/accounts/import", h.withAdminAuth(h.adminImportAccount))

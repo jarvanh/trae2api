@@ -3,8 +3,13 @@ package server
 
 import (
 	_ "embed"
+	"encoding/json"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -130,9 +135,20 @@ func (h *Handler) adminCredits(w http.ResponseWriter, r *http.Request) {
 	}
 	wg.Wait()
 
+	// 应用控制台拖动保存的账号顺序（未出现的按 UID 追加在后，新增账号不会丢）
+	ids := make([]string, 0, len(out))
+	byUID := make(map[string]acct, len(out))
+	for _, a := range out {
+		ids = append(ids, a.UID)
+		byUID[a.UID] = a
+	}
+	ordered := make([]acct, 0, len(out))
+	for _, uid := range reorderBy(ids, h.loadUIOrder().Accounts) {
+		ordered = append(ordered, byUID[uid])
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"fetched_at": time.Now().Format("2006-01-02 15:04:05"),
-		"accounts":   out,
+		"accounts":   ordered,
 	})
 }
 
@@ -165,7 +181,45 @@ func (h *Handler) adminModels(w http.ResponseWriter, r *http.Request) {
 			return items[i].ID < items[j].ID
 		})
 	}
+	// 默认隐藏上游返回的内部/占位模型（custom_model_*、*_subagent/*_agent、summary），
+	// 加 ?all=1 可看全量。上游没有标识字段，只能按命名模式识别。
+	showAll := r.URL.Query().Get("all") == "1"
+	hidden := 0
 	dynamic := false
+	order := h.loadUIOrder()
+
+	emit := func(items []modelItem, dynamic bool) {
+		if !showAll {
+			kept := items[:0]
+			for _, it := range items {
+				if isInternalModel(it.ID) {
+					hidden++
+					continue
+				}
+				kept = append(kept, it)
+			}
+			items = kept
+		}
+		sortItems(items)
+		// 应用控制台拖动保存的顺序（未出现的按默认序追加在后）
+		ids := make([]string, 0, len(items))
+		byID := make(map[string]modelItem, len(items))
+		for _, it := range items {
+			ids = append(ids, it.ID)
+			byID[it.ID] = it
+		}
+		out := make([]modelItem, 0, len(items))
+		for _, id := range reorderBy(ids, order.Models) {
+			out = append(out, byID[id])
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"fetched_at":      time.Now().Format("2006-01-02 15:04:05"),
+			"dynamic":         dynamic,
+			"models":          out,
+			"internal_hidden": hidden,
+		})
+	}
+
 	if infos := h.fetchDynamicModels(); len(infos) > 0 {
 		dynamic = true
 		items := make([]modelItem, 0, len(infos))
@@ -176,12 +230,7 @@ func (h *Handler) adminModels(w http.ResponseWriter, r *http.Request) {
 			}
 			items = append(items, modelItem{ID: mi.ID, ContextLength: cl, ConsumptionRate: mi.Rate})
 		}
-		sortItems(items)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"fetched_at": time.Now().Format("2006-01-02 15:04:05"),
-			"dynamic":    true,
-			"models":     items,
-		})
+		emit(items, true)
 		return
 	}
 	// 回退：静态表（不含倍率）
@@ -191,10 +240,109 @@ func (h *Handler) adminModels(w http.ResponseWriter, r *http.Request) {
 		cl, _ := m["context_length"].(int)
 		items = append(items, modelItem{ID: id, ContextLength: int64(cl), ConsumptionRate: 0})
 	}
-	sortItems(items)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"fetched_at": time.Now().Format("2006-01-02 15:04:05"),
-		"dynamic":    dynamic,
-		"models":     items,
-	})
+	emit(items, dynamic)
+}
+
+// isInternalModel 判定上游返回的「内部 / 占位」模型（控制台默认隐藏）。
+//
+// 上游 get_detail_param 会把内部子代理、自定义占位配置一并放在 config_info_list
+// 里返回，且**没有任何标识字段**区分它们 —— 只能按命名模式识别：
+//   - custom_model_*  ：占位/自定义配置（实测 14 个）
+//   - *_subagent/*_agent：内部子代理（browser_use / computer_use / explore / file_search）
+//   - summary         ：内部摘要功能
+//
+// 注意：aquila / sagitta / claude-opus-5 等虽倍率为 0 或有内部色彩，
+// 但命名像真实可用模型，保守保留，不过滤。
+func isInternalModel(id string) bool {
+	if id == "" {
+		return true
+	}
+	if strings.HasPrefix(id, "custom_model_") {
+		return true
+	}
+	if strings.HasSuffix(id, "_subagent") || strings.HasSuffix(id, "_agent") {
+		return true
+	}
+	return id == "summary"
+}
+
+// uiOrder 控制台自定义顺序（拖动排序后保存）：键为列表名，值为 uid / 模型 ID 序列。
+type uiOrder struct {
+	Accounts []string `json:"accounts,omitempty"`
+	Models   []string `json:"models,omitempty"`
+}
+
+// adminOrderPath UI 顺序持久化路径；UsageDir 为空时不落盘（重启后回到默认序）。
+func (h *Handler) adminOrderPath() string {
+	if h.cfg.UsageDir == "" {
+		return ""
+	}
+	return filepath.Join(h.cfg.UsageDir, "admin-order.json")
+}
+
+func (h *Handler) loadUIOrder() uiOrder {
+	p := h.adminOrderPath()
+	if p == "" {
+		return uiOrder{}
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return uiOrder{}
+	}
+	var o uiOrder
+	_ = json.Unmarshal(raw, &o)
+	return o
+}
+
+// reorderBy 按自定义顺序重排：order 里出现的按序在前，未出现的保持原相对序追加在后。
+// order 为空或全不匹配时原样返回，保证新增条目不会因旧快照而丢失。
+func reorderBy(ids []string, order []string) []string {
+	if len(order) == 0 || len(ids) == 0 {
+		return ids
+	}
+	pos := make(map[string]int, len(ids))
+	for i, id := range ids {
+		pos[id] = i
+	}
+	out := make([]string, 0, len(ids))
+	used := make(map[string]bool, len(ids))
+	for _, id := range order {
+		if _, ok := pos[id]; ok && !used[id] {
+			out = append(out, id)
+			used[id] = true
+		}
+	}
+	for _, id := range ids {
+		if !used[id] {
+			out = append(out, id)
+			used[id] = true
+		}
+	}
+	return out
+}
+
+// adminGetOrder 返回已保存的控制台顺序（读接口，无鉴权）。
+func (h *Handler) adminGetOrder(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, h.loadUIOrder())
+}
+
+// adminSaveOrder 保存控制台拖动排序结果（写操作，需 Bearer 鉴权）。
+// 仅影响 UI 展示顺序，**不改变 pool 选号逻辑**（选号仍按权益包过期/剩余积分规则序）。
+func (h *Handler) adminSaveOrder(w http.ResponseWriter, r *http.Request) {
+	p := h.adminOrderPath()
+	if p == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "UsageDir 未配置，无法保存顺序"})
+		return
+	}
+	var o uiOrder
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&o); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad json: " + err.Error()})
+		return
+	}
+	raw, _ := json.MarshalIndent(o, "", "  ")
+	if err := os.WriteFile(p, raw, 0o644); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "save failed: " + err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
