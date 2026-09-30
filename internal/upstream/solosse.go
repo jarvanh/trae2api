@@ -30,6 +30,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -308,23 +309,64 @@ func sortInts(a []int) {
 // Stream 流式转换：SOLO SSE → OpenAI SSE chunk，每 chunk flush，保证至少一个 [DONE]。
 // 调用方必须先设置过 status 200；本函数自设 SSE headers。
 func Stream(w http.ResponseWriter, r io.Reader) error {
-	return streamOpts(w, r, nil)
+	return streamOpts(w, r, nil, 0)
 }
 
 // StreamWithError 同 Stream，额外在遇到上游 event:error 时回调 onErr（非 nil），
 // 供调用方冷却账号/记录日志；错误信息同时注入 SSE 事件流。
 func StreamWithError(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)) error {
-	return streamOpts(w, r, onErr)
+	return streamOpts(w, r, onErr, 0)
 }
 
-// streamOpts Stream 的可选参数版本。
-func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)) error {
+// StreamWithKeepalive 同 StreamWithError，额外在「首个真实帧到达前」按 keepalive
+// 间隔向客户端发送 SSE 注释帧 `: ping`，防止边缘网关（volc-dcdn/tengine）在长排队
+// 窗口因连接静默而提前掐断（表现为 502 Bad Gateway）。
+//
+// 注释帧是 SSE 标准规定的心跳形态，scanLine 已忽略 `:` 前缀行，对解析零副作用。
+// keepalive <= 0 表示关闭（等同 StreamWithError）。
+func StreamWithKeepalive(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError), keepalive time.Duration) error {
+	return streamOpts(w, r, onErr, keepalive)
+}
+
+// streamOpts Stream 的可选参数版本。keepalive > 0 时启用首帧前心跳。
+func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError), keepalive time.Duration) error {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
 	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no")
 	fl, _ := w.(http.Flusher)
+
+	// writeMu 串行化「心跳帧」与「数据帧」的写入，避免心跳 goroutine 与主循环并发写 w。
+	var writeMu sync.Mutex
+	// firstFrame 关闭后心跳 goroutine 退出（首帧已到达，连接不再静默）。
+	firstFrame := make(chan struct{})
+	var stopOnce sync.Once
+	stopPing := func() { stopOnce.Do(func() { close(firstFrame) }) }
+	defer stopPing()
+
+	if keepalive > 0 && fl != nil {
+		go func() {
+			t := time.NewTicker(keepalive)
+			defer t.Stop()
+			for {
+				select {
+				case <-firstFrame:
+					return
+				case <-t.C:
+					writeMu.Lock()
+					_, err := io.WriteString(w, ": ping\n\n")
+					if fl != nil {
+						fl.Flush()
+					}
+					writeMu.Unlock()
+					if err != nil { // 客户端已断开，停止心跳
+						return
+					}
+				}
+			}
+		}()
+	}
 
 	br := bufio.NewReaderSize(r, 64*1024)
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
@@ -353,20 +395,27 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 			pendingUsage = nil
 		}
 		raw, _ := json.Marshal(chunk)
-		if _, err := io.WriteString(w, "data: "+string(raw)+"\n\n"); err != nil {
-			return err
-		}
+		writeMu.Lock()
+		_, err := io.WriteString(w, "data: "+string(raw)+"\n\n")
 		if fl != nil {
 			fl.Flush()
 		}
+		writeMu.Unlock()
+		if err != nil {
+			return err
+		}
+		stopPing() // 已有真实数据，连接不再静默，停心跳
 		return nil
 	}
 	writeDONE := func() error {
-		if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
-			return err
-		}
+		writeMu.Lock()
+		_, err := io.WriteString(w, "data: [DONE]\n\n")
 		if fl != nil {
 			fl.Flush()
+		}
+		writeMu.Unlock()
+		if err != nil {
+			return err
 		}
 		return nil
 	}

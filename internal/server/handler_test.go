@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -722,5 +723,79 @@ func TestSessionAffinityRouting(t *testing.T) {
 	// 第二轮 u1 被抬到 999 后若无知会漂移到 u2，粘性必须压住这个漂移。
 	if chatAuths[0] != "Cloud-IDE-JWT at1" || chatAuths[1] != "Cloud-IDE-JWT at1" {
 		t.Fatalf("affinity failed: got %v, expected both to be at1 (least credits on first pick)", chatAuths)
+	}
+}
+
+// TestChatBusyDoesNotRotate 验证 502/504（边缘网关全局拥堵）不会轮换账号：
+// 上游只应被调用一次，直接快速失败给调用方，而不是把 1 个请求放大成 N 个上游请求。
+func TestChatBusyDoesNotRotate(t *testing.T) {
+	var calls int32
+	up := newFakeUpstreamPath(t, &calls, func(authz string) (int, string, bool) {
+		if authz == "" {
+			t.Errorf("missing auth header")
+		}
+		return 502, `<html><h1>502 Bad Gateway</h1></html><hr/>Powered by volc-dcdn`, false
+	})
+	// 两个健康账号：若发生轮换，calls 会 >1
+	h := NewHandler(Config{
+		Pool: testPoolWith(
+			&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+			&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+		),
+		Upstream: up,
+	})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("upstream called %d times, want 1 (busy must not rotate)", got)
+	}
+	if rec.Code != 502 {
+		t.Errorf("code=%d want 502, body=%s", rec.Code, rec.Body)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Errorf("missing Retry-After header")
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("body not json: %v", err)
+	}
+	if errObj, ok := resp["error"].(map[string]any); !ok || errObj["code"] != "upstream_busy" {
+		t.Errorf("error payload = %v, want code upstream_busy", resp["error"])
+	}
+	// 账号不应因全局拥堵被冷却/禁用
+	for _, uid := range []string{"u1", "u2"} {
+		if st, ok := h.cfg.Pool.Status(uid); ok && (st.Cooling || st.Disabled) {
+			t.Errorf("account %s must stay healthy on global busy: %+v", uid, st)
+		}
+	}
+}
+
+// newFakeUpstreamPath 同 newFakeUpstream，但只统计聊天端点（llm_utils_chat）的调用次数：
+// 排除 get_detail_param 等模型列表拉取，避免把既有行为误判为「轮换」。
+func newFakeUpstreamPath(t *testing.T, chatCalls *int32, behavior func(auth string) (int, string, bool)) *upstream.Client {
+	t.Helper()
+	return &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, "/api/agent/v3/llm_utils_chat") {
+				atomic.AddInt32(chatCalls, 1)
+			}
+			status, body, isStream := behavior(r.Header.Get("Authorization"))
+			ct := "application/json"
+			if isStream {
+				ct = "text/event-stream"
+			}
+			return &http.Response{
+				StatusCode: status,
+				Header:     http.Header{"Content-Type": []string{ct}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		})},
+		AgentHost: "https://fake.example",
+		UgHost:    "https://fake.example",
+		OAuthHost: "https://fake.example",
+		ClientID:  upstream.ClientID,
 	}
 }

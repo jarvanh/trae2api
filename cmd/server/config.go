@@ -39,6 +39,13 @@ type Config struct {
 
 	Upstream struct {
 		TimeoutSeconds int `json:"timeout_seconds"` // 120
+		// MaxInFlight 单账号最大并发在途请求数（<=0 = 不限制）。
+		// 上游拥堵窗口调小（如 1~2）可把流量摊到多个账号，避免全堆在一个号上排队。
+		MaxInFlight int `json:"max_in_flight"` // 0 = 沿用 pool 默认（3）
+		// KeepaliveSeconds 流式响应在「首个真实帧到达前」的心跳间隔（SSE 注释帧 `: ping`）。
+		// 用于防止边缘网关（volc-dcdn/tengine）因长排队窗口连接静默而提前掐断（502）。
+		// 0 = 关闭心跳（等同旧行为）。
+		KeepaliveSeconds int `json:"keepalive_seconds"` // 15
 	} `json:"upstream"`
 
 	// 解析后的 duration。
@@ -170,6 +177,13 @@ func (c *Config) normalize() error {
 	}
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120
+	}
+	// MaxInFlight <= 0 → 沿用 pool 默认（3），不调用 SetMaxInFlight 覆盖。
+	// KeepaliveSeconds 未设置（0）→ 默认 15s 开启心跳；负数 → 显式关闭。
+	if c.Upstream.KeepaliveSeconds < 0 {
+		c.Upstream.KeepaliveSeconds = 0
+	} else if c.Upstream.KeepaliveSeconds == 0 {
+		c.Upstream.KeepaliveSeconds = 15
 	}
 	if c.DefaultModel == "" {
 		c.DefaultModel = "glm-5.2"

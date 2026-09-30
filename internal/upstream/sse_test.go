@@ -316,3 +316,15 @@ func TestPrepareBodyToolCallWithoutNameDropped(t *testing.T) {
 		t.Error("tool_call without name should be dropped")
 	}
 }
+
+// TestScanLineIgnoresPing 回归保护：keepalive 心跳帧 `: ping` 不能产生任何 SSE 事件，
+// 否则心跳会污染业务数据流（scanLine 对 `:` 前缀行应直接忽略）。
+func TestScanLineIgnoresPing(t *testing.T) {
+	st := &sseState{}
+	if ev := scanLine(st, ": ping"); ev != nil {
+		t.Errorf("ping comment produced event: %+v", ev)
+	}
+	if st.event != "" || st.data.Len() != 0 {
+		t.Errorf("ping comment mutated state: event=%q data=%q", st.event, st.data.String())
+	}
+}

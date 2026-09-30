@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -38,6 +39,9 @@ type Config struct {
 	DefaultModel    string        // 默认 glm-5.2
 	WorkBridgeURL   string        // 本地 Work 积分桥接端点，如 http://127.0.0.1:7865
 	WorkBridgeToken string        // 访问 WorkBridge 的 Bearer token（空 = 不带鉴权）
+	// Keepalive 流式响应在「首个真实帧到达前」的心跳间隔（SSE 注释帧 `: ping`）。
+	// <=0 = 关闭。用于防止边缘网关因长排队窗口连接静默而提前掐断（502）。
+	Keepalive time.Duration
 }
 
 // maxBodyBytes 请求体大小上限（8MB），超过返回 413。
@@ -637,10 +641,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			_ = acct.SaveAtomic()
 		}
 
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body)
+		// 接 r.Context()：客户端断连（含 Cloudflare 100s 524 掐断）立即取消上游，
+		// 避免下游放弃后上游仍空烧算力（拥堵窗口的主要放大器之一）。
+		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(r.Context(), acct, body)
 		if terr != nil {
 			lastErr = terr
 			h.cfg.Pool.RecordError(acct.UID)
+			// 首字节超时（timeout awaiting response headers）也是全局排队信号：
+			// 换号只会往同一个拥堵的算力池再灌一份流量，故快速失败而非轮换。
+			var ne net.Error
+			if errors.As(terr, &ne) && ne.Timeout() {
+				st.status = http.StatusGatewayTimeout
+				w.Header().Set("Retry-After", "8")
+				writeOpenAIError(w, http.StatusGatewayTimeout, "upstream_busy",
+					"upstream timed out before first byte (global congestion), not rotating accounts: "+terr.Error())
+				return
+			}
 			h.cfg.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
 			continue
 		}
@@ -670,6 +686,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.cfg.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, "upstream 404")
 				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 				continue
+			case upstream.ErrUpstreamBusy:
+				// 502/504 是边缘网关（volc-dcdn/tengine）在算力紧张时掐断连接，与账号无关。
+				// 换号只会把 1 个请求放大成 N 个上游请求，加剧拥堵 → 不冷却、不计错、不轮换，
+				// 直接快速失败，把重试/换源的决定权交回调用方（如 CliRelay 的多源路由）。
+				st.status = status
+				w.Header().Set("Retry-After", "8")
+				writeOpenAIError(w, status, "upstream_busy",
+					"upstream gateway busy (global congestion), not rotating accounts")
+				return
 			default:
 				h.cfg.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
 				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
@@ -682,9 +707,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.status = http.StatusOK
 			statsR := newChatStatsReaderSince(rc, st.start)
 			// 流内业务错误（1005 plan/5xx 等）→ 冷却账号，错误信息注入 SSE。
-			_ = upstream.StreamWithError(w, statsR, func(se *upstream.SOLOStreamError) {
+			// Keepalive > 0 时在首帧到达前发 `: ping` 注释帧，防边缘网关静默掐断（502）。
+			_ = upstream.StreamWithKeepalive(w, statsR, func(se *upstream.SOLOStreamError) {
 				h.handleStreamError(acct.UID, se)
-			})
+			}, h.cfg.Keepalive)
 			rc.Close()
 			if toks, ok := statsR.Tokens(); ok {
 				st.toks = toks

@@ -4,6 +4,7 @@ package upstream
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,13 +22,14 @@ import (
 type ErrKind int
 
 const (
-	ErrNone        ErrKind = iota // 成功
-	ErrPlanLimit                  // 1005 + plan → 权益不足（硬冷却 12h）
-	ErrSoftRate                   // 429 → 短冷却 60s
-	ErrSessionDead                // 401 + Cloud-IDE-JWT 失效 → 禁用
-	ErrNotFound                   // 404 → 短冷却 60s 不累计 errCount
-	ErrServer                     // 5xx
-	ErrClient                     // 其他 4xx
+	ErrNone         ErrKind = iota // 成功
+	ErrPlanLimit                   // 1005 + plan → 权益不足（硬冷却 12h）
+	ErrSoftRate                    // 429 → 短冷却 60s
+	ErrSessionDead                 // 401 + Cloud-IDE-JWT 失效 → 禁用
+	ErrNotFound                    // 404 → 短冷却 60s 不累计 errCount
+	ErrServer                      // 5xx
+	ErrClient                      // 其他 4xx
+	ErrUpstreamBusy                // 502/504 边缘网关（volc-dcdn/tengine）→ 全局性拥堵，换号无用
 )
 
 func (k ErrKind) String() string {
@@ -44,6 +46,8 @@ func (k ErrKind) String() string {
 		return "server"
 	case ErrClient:
 		return "client"
+	case ErrUpstreamBusy:
+		return "upstream_busy"
 	default:
 		return "none"
 	}
@@ -103,6 +107,11 @@ func Classify(status int, body string) ErrKind {
 	}
 	if status == http.StatusNotFound {
 		return ErrNotFound
+	}
+	// 502/504 是火山边缘网关（volc-dcdn/tengine）在算力紧张时掐断连接的产物：
+	// 属全局性拥堵，与账号无关，换号只会放大上游流量，故单列一类由调用方快速失败。
+	if status == http.StatusBadGateway || status == http.StatusGatewayTimeout {
+		return ErrUpstreamBusy
 	}
 	if status >= 500 {
 		return ErrServer
@@ -253,10 +262,14 @@ func normalizeExpiresAt(v int64) int64 {
 }
 
 // ChatStream 发 llm_utils_chat 请求并返回原始 SSE body 流（调用方负责 Close）。
+// ctx 用于客户端断连时立即取消上游请求，避免下游放弃后上游仍空烧算力。
 // 非 2xx 时 rc 为 nil、body 为上游响应体（供调用方 Classify）、err 为 nil；
 // 只有传输层失败才返回 err。
-func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, err error) {
-	req, err := http.NewRequest(http.MethodPost, c.agentBase()+EpChat, bytes.NewReader(PrepareBody(body)))
+func (c *Client) ChatStream(ctx context.Context, a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.agentBase()+EpChat, bytes.NewReader(PrepareBody(body)))
 	if err != nil {
 		return nil, 0, nil, err
 	}
