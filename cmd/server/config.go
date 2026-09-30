@@ -37,6 +37,10 @@ type Config struct {
 		RefreshHours []int `json:"refresh_hours"` // [3]
 	} `json:"schedule"`
 
+	// UsageRetentionDays 日粒度流水保留天数：超期归档成月汇总后删除明细。
+	// 0（默认）= 不启用，维持永久保留；建议 90。
+	UsageRetentionDays int `json:"usage_retention_days"`
+
 	Upstream struct {
 		TimeoutSeconds int `json:"timeout_seconds"` // 120
 		// KeepaliveSeconds 流式响应在「首个真实帧到达前」的心跳间隔（SSE 注释帧 `: ping`）。
@@ -72,6 +76,7 @@ func Default() *Config {
 	c.Schedule.CheckinHour = 9
 	c.Schedule.RefreshHours = []int{3}
 	c.Upstream.TimeoutSeconds = 120
+	c.UsageRetentionDays = 0 // 默认不启用归档（维持现状）
 	return c
 }
 
@@ -149,6 +154,11 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("TW2A_CHECKIN_HOUR"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Schedule.CheckinHour = n
+		}
+	}
+	if v := os.Getenv("TW2A_USAGE_RETENTION_DAYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			c.UsageRetentionDays = n
 		}
 	}
 	if v := os.Getenv("TW2A_TIMEOUT_SECONDS"); v != "" {

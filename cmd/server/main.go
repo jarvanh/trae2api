@@ -64,6 +64,10 @@ func main() {
 		CheckinHour:  cfg.Schedule.CheckinHour,
 		RefreshHours: cfg.Schedule.RefreshHours,
 		RefreshSkew:  24 * time.Hour,
+		// 流水归档钩子：UsageRetentionDays<=0 时 ArchiveUsage 内部直接返回 0,0（不启用）
+		ArchiveUsage: func() (int, int, error) {
+			return server.ArchiveUsage(cfg.UsageDir, cfg.UsageRetentionDays)
+		},
 	})
 
 	h := server.NewHandler(server.Config{

@@ -17,6 +17,7 @@ package server
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -283,6 +284,241 @@ func (a *usageAggregate) add(e usageEntry) {
 	if !e.OK() {
 		b.Errors++
 	}
+}
+
+// ArchiveUsage 导出入口：供 main 装配到 scheduler 的每日归档钩子。
+// 内部转调 usageArchiveOlderThan，以「当前时间」为保留期基准。
+// 安全纪律（顺序不可颠倒）：以上归档逻辑**先写汇总、确认成功后再删明细**。
+
+// ─── 保留期归档 ────────────────────────────────────────────────────────────
+//
+// 日粒度明细按保留期（默认 90 天）滚动：超期的日子归档成**月粒度汇总**后删除明细。
+// 汇总保留统计（请求数/成败/token/按模型/按天），丢掉逐条明细 —— 长期趋势不丢，
+// 体积不再无限增长。retentionDays <= 0 时不启用（维持永久保留的现状）。
+
+// ArchiveUsage 导出入口：供 main 装配到 scheduler 的每日归档钩子。
+// 内部转调 usageArchiveOlderThan，以「当前时间」为保留期基准。
+func ArchiveUsage(dir string, retentionDays int) (int, int, error) {
+	return usageArchiveOlderThan(dir, retentionDays, time.Now())
+}
+
+// usageMonthlyPath 月粒度归档文件路径。
+func usageMonthlyPath(dir, month string) string {
+	return filepath.Join(dir, "usage-monthly-"+month+".json")
+}
+
+// usageByDay 归档里的单日摘要（只留统计，明细已丢）。
+type usageByDay struct {
+	Date     string `json:"date"`
+	Requests int    `json:"requests"`
+	Probe    int    `json:"probe"`
+	Errors   int    `json:"errors"`
+	In       int64  `json:"in"`
+	Out      int64  `json:"out"`
+}
+
+// usageMonthly 月粒度归档。
+type usageMonthly struct {
+	Month     string         `json:"month"` // "2026-06"
+	Days      int            `json:"days"`  // 已归档天数
+	Requests  int            `json:"requests"`
+	Probe     int            `json:"probe"`
+	Real      int            `json:"real"`
+	Errors    int            `json:"errors"`
+	In        int64          `json:"in"`
+	Out       int64          `json:"out"`
+	ByModel   []usageByModel `json:"by_model"`
+	ByDay     []usageByDay   `json:"by_day"`
+	UpdatedAt int64          `json:"updated_at"`
+}
+
+// hasDay 该日期是否已归档（幂等：同一天绝不重复累计）。
+func (m *usageMonthly) hasDay(date string) bool {
+	for _, d := range m.ByDay {
+		if d.Date == date {
+			return true
+		}
+	}
+	return false
+}
+
+// addDay 把某天的聚合并入月汇总。
+func (m *usageMonthly) addDay(date string, agg usageAggregate) {
+	m.Days++
+	m.Requests += agg.Requests
+	m.Probe += agg.Probe
+	m.Real += agg.Real
+	m.Errors += agg.Errors
+	m.In += agg.In
+	m.Out += agg.Out
+	m.ByDay = append(m.ByDay, usageByDay{
+		Date: date, Requests: agg.Requests, Probe: agg.Probe,
+		Errors: agg.Errors, In: agg.In, Out: agg.Out,
+	})
+	m.mergeModels(agg.ByModel)
+}
+
+// mergeModels 按模型名累加（同名合并，新增追加）。
+func (m *usageMonthly) mergeModels(list []usageByModel) {
+	idx := make(map[string]int, len(m.ByModel))
+	for i, b := range m.ByModel {
+		idx[b.Model] = i
+	}
+	for _, b := range list {
+		if i, ok := idx[b.Model]; ok {
+			m.ByModel[i].Requests += b.Requests
+			m.ByModel[i].In += b.In
+			m.ByModel[i].Out += b.Out
+			m.ByModel[i].Errors += b.Errors
+		} else {
+			m.ByModel = append(m.ByModel, b)
+			idx[b.Model] = len(m.ByModel) - 1
+		}
+	}
+}
+
+// usageListDayFiles 列出目录内所有日粒度流水文件，返回 date→path。
+// 文件名不符合 usage-YYYY-MM-DD.jsonl 的一律忽略（防误删无关文件）。
+func usageListDayFiles(dir string) map[string]string {
+	out := map[string]string{}
+	if dir == "" {
+		return out
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return out
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasPrefix(name, "usage-") || !strings.HasSuffix(name, ".jsonl") {
+			continue
+		}
+		date := strings.TrimSuffix(strings.TrimPrefix(name, "usage-"), ".jsonl")
+		if _, err := time.Parse("2006-01-02", date); err != nil {
+			continue // 名字不合法，不动它
+		}
+		out[date] = filepath.Join(dir, name)
+	}
+	return out
+}
+
+// usageArchiveOlderThan 归档超过保留期的日粒度流水。
+//
+// 安全纪律（顺序不可颠倒）：
+//  1. 先读全部待归档日 → 聚合 → 写月汇总（原子写 tmp+rename）
+//  2. **确认汇总写成功之后**才删除日明细文件
+//     先删后写一旦中途失败，数据就真没了 —— 归档绝不能成为数据丢失的路径
+//  3. 幂等：月汇总里已有的日期跳过，重复执行不会把统计翻倍
+//
+// 返回归档天数、删除文件数；retentionDays <= 0 时返回 0,0（不启用）。
+func usageArchiveOlderThan(dir string, retentionDays int, now time.Time) (int, int, error) {
+	if dir == "" || retentionDays <= 0 {
+		return 0, 0, nil
+	}
+	today := now.In(beijing).Format("2006-01-02")
+	dayFiles := usageListDayFiles(dir)
+
+	// 按目标月份分组待归档日期
+	byMonth := map[string][]string{}
+	for date := range dayFiles {
+		if date >= today {
+			continue // 今天及以后永不归档
+		}
+		d, err := time.Parse("2006-01-02", date)
+		if err != nil {
+			continue
+		}
+		ageDays := int(now.In(beijing).Sub(d).Hours() / 24)
+		if ageDays <= retentionDays {
+			continue
+		}
+		month := date[:7]
+		byMonth[month] = append(byMonth[month], date)
+	}
+
+	archived, removed := 0, 0
+	var firstErr error
+	for month, dates := range byMonth {
+		sort.Strings(dates)
+		m, err := usageLoadMonthly(dir, month)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("读取月度归档 %s 失败：%w", month, err)
+			}
+			continue
+		}
+		var done []string
+		for _, date := range dates {
+			if m.hasDay(date) {
+				continue
+			}
+			_, agg, _ := usageScan(dir, date, 1) // 只要聚合，明细不进内存
+			m.addDay(date, agg)
+			done = append(done, date)
+		}
+		if len(done) == 0 {
+			continue
+		}
+		m.UpdatedAt = time.Now().Unix()
+		if err := usageWriteMonthly(dir, m); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("写入月度归档 %s 失败：%w", month, err)
+			}
+			continue // 汇总没写成功 → 绝不删明细
+		}
+		// 汇总已落盘，才敢删明细
+		for _, date := range done {
+			if err := os.Remove(dayFiles[date]); err != nil {
+				log.Printf("[usage] 归档后删除 %s 失败：%v", dayFiles[date], err)
+				continue
+			}
+			removed++
+		}
+		archived += len(done)
+	}
+	return archived, removed, firstErr
+}
+
+// usageLoadMonthly 读取月归档；不存在时返回空结构（不是错误）。
+func usageLoadMonthly(dir, month string) (*usageMonthly, error) {
+	m := &usageMonthly{Month: month, ByModel: []usageByModel{}, ByDay: []usageByDay{}}
+	raw, err := os.ReadFile(usageMonthlyPath(dir, month))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return m, nil
+		}
+		return nil, err
+	}
+	if err := json.Unmarshal(raw, m); err != nil {
+		return nil, err
+	}
+	if m.ByModel == nil {
+		m.ByModel = []usageByModel{}
+	}
+	if m.ByDay == nil {
+		m.ByDay = []usageByDay{}
+	}
+	return m, nil
+}
+
+// usageWriteMonthly 原子写月归档（tmp + rename），避免半截文件。
+func usageWriteMonthly(dir string, m *usageMonthly) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	raw, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	final := usageMonthlyPath(dir, m.Month)
+	tmp := final + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, final)
 }
 
 // finish 把内部 map 累计固化成有序切片，并按请求数降序（并列按模型名）。

@@ -21,6 +21,11 @@ type Config struct {
 	CheckinHour  int           // 每日签到小时，默认 9
 	RefreshHours []int         // token 预刷新小时，默认 [3]
 	RefreshSkew  time.Duration // 预刷新窗口，默认 24h
+
+	// ArchiveUsage 流水归档钩子（可选，nil = 不启用）。
+	// 用函数注入而非直接 import server 包：scheduler 只依赖 pool/upstream，
+	// 反向依赖会把「调度器」和「HTTP 服务层」绑死，也让单测没法独立构造。
+	ArchiveUsage func() (archived int, removed int, err error)
 }
 
 // Scheduler 调度器。
@@ -74,8 +79,26 @@ func (s *Scheduler) Run(ctx context.Context) {
 			}
 			if s.cfg.CheckinHour == h {
 				s.RunCheckinNow()
+				// 归档挂在签到这一轮：一天一次足够，且此时上游刚被查过一轮
+				s.RunArchiveNow()
 			}
 		}
+	}
+}
+
+// RunArchiveNow 立即执行一次流水归档（超保留期的日明细 → 月汇总）。
+// 未配置钩子或归档失败都只 log：归档是后台维护动作，绝不能影响签到主流程。
+func (s *Scheduler) RunArchiveNow() {
+	if s.cfg.ArchiveUsage == nil {
+		return
+	}
+	archived, removed, err := s.cfg.ArchiveUsage()
+	if err != nil {
+		log.Printf("[scheduler] 流水归档失败：%v", err)
+		return
+	}
+	if archived > 0 || removed > 0 {
+		log.Printf("[scheduler] 流水归档完成：归档 %d 天，删除明细 %d 个", archived, removed)
 	}
 }
 

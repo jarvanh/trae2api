@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // writeUsageFile 构造一个 usage jsonl 测试文件并返回其目录。
@@ -230,5 +231,183 @@ func TestUsageScanPathTraversal(t *testing.T) {
 	p := usageFilePath(dir, "../../etc/passwd")
 	if strings.Contains(p, "..") && filepath.IsAbs(p) && !strings.HasPrefix(filepath.Clean(p), filepath.Clean(dir)) {
 		t.Errorf("路径穿越防护失效：%s", p)
+	}
+}
+
+/* ─── 保留期归档 ─── */
+
+// mkDay 在 dir 下造一个指定日期的日流水文件，返回该日期字符串。
+func mkDay(t *testing.T, dir string, d time.Time, n int) string {
+	t.Helper()
+	date := d.In(beijing).Format("2006-01-02")
+	var lines []string
+	for i := 0; i < n; i++ {
+		lines = append(lines, entry(d.Unix()+int64(i), "glm-5.3", false, 10, 20))
+	}
+	if err := os.WriteFile(usageFilePath(dir, date), []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("写 %s 失败：%v", date, err)
+	}
+	return date
+}
+
+// TestArchiveDisabled retentionDays<=0 必须什么都不做（维持永久保留的现状）。
+func TestArchiveDisabled(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().In(beijing)
+	mkDay(t, dir, now.AddDate(0, 0, -200), 3)
+	archived, removed, err := usageArchiveOlderThan(dir, 0, now)
+	if err != nil || archived != 0 || removed != 0 {
+		t.Errorf("retention=0 应不启用：archived=%d removed=%d err=%v", archived, removed, err)
+	}
+	if files := usageListDayFiles(dir); len(files) != 1 {
+		t.Errorf("retention=0 不应删任何文件，剩 %d", len(files))
+	}
+}
+
+// TestArchiveArchivesOldDays 超保留期的日明细应被归档进月汇总并删除。
+func TestArchiveArchivesOldDays(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().In(beijing)
+	old := mkDay(t, dir, now.AddDate(0, 0, -120), 4)
+	recent := mkDay(t, dir, now.AddDate(0, 0, -10), 2)
+
+	archived, removed, err := usageArchiveOlderThan(dir, 90, now)
+	if err != nil {
+		t.Fatalf("归档失败：%v", err)
+	}
+	if archived != 1 || removed != 1 {
+		t.Fatalf("应归档 1 天删 1 个文件，got archived=%d removed=%d", archived, removed)
+	}
+	// 近期文件必须还在
+	if _, err := os.Stat(usageFilePath(dir, recent)); err != nil {
+		t.Errorf("未超期的 %s 不应被删", recent)
+	}
+	// 超期的明细文件应已消失
+	if _, err := os.Stat(usageFilePath(dir, old)); !os.IsNotExist(err) {
+		t.Errorf("超期的 %s 应已被删", old)
+	}
+	// 月汇总应存在且统计正确
+	m, err := usageLoadMonthly(dir, old[:7])
+	if err != nil {
+		t.Fatalf("读月汇总失败：%v", err)
+	}
+	if m.Requests != 4 {
+		t.Errorf("月汇总请求数 = %d, 期望 4", m.Requests)
+	}
+	if m.In != 40 || m.Out != 80 {
+		t.Errorf("月汇总 token = %d/%d, 期望 40/80", m.In, m.Out)
+	}
+	if len(m.ByDay) != 1 || m.ByDay[0].Date != old {
+		t.Errorf("月汇总按天记录错误：%+v", m.ByDay)
+	}
+}
+
+// TestArchiveIdempotent 幂等：重复执行不能把统计翻倍。
+// 这是归档最容易踩的坑 —— 同一天被算两次，长期趋势就全错了。
+func TestArchiveIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().In(beijing)
+	mkDay(t, dir, now.AddDate(0, 0, -120), 5)
+
+	if _, _, err := usageArchiveOlderThan(dir, 90, now); err != nil {
+		t.Fatalf("首次归档失败：%v", err)
+	}
+	// 第二次：文件已删，应无新增
+	a2, r2, err := usageArchiveOlderThan(dir, 90, now)
+	if err != nil {
+		t.Fatalf("二次归档失败：%v", err)
+	}
+	if a2 != 0 || r2 != 0 {
+		t.Errorf("二次归档应无操作，got archived=%d removed=%d", a2, r2)
+	}
+	m, _ := usageLoadMonthly(dir, now.AddDate(0, 0, -120).In(beijing).Format("2006-01-02")[:7])
+	if m.Requests != 5 {
+		t.Errorf("重复执行后请求数 = %d, 期望 5（不能翻倍）", m.Requests)
+	}
+}
+
+// TestArchiveNeverTouchesToday 今天的文件绝不归档 —— 归档当天正在写入的数据会丢账单。
+func TestArchiveNeverTouchesToday(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().In(beijing)
+	today := mkDay(t, dir, now, 6)
+
+	a, r, err := usageArchiveOlderThan(dir, 0, now) // retention=0 意为「全部超期」
+	if err != nil {
+		t.Fatalf("归档失败：%v", err)
+	}
+	// retention<=0 直接不启用；换用小 retention 验证「今天」保护
+	a, r, err = usageArchiveOlderThan(dir, 1, now)
+	if err != nil {
+		t.Fatalf("归档失败：%v", err)
+	}
+	if a != 0 || r != 0 {
+		t.Errorf("今天的数据不应被归档：archived=%d removed=%d", a, r)
+	}
+	if _, err := os.Stat(usageFilePath(dir, today)); err != nil {
+		t.Errorf("今天的 %s 必须保留", today)
+	}
+}
+
+// TestArchiveMergesMultipleDays 同一个月的多天应合并进一份月汇总。
+func TestArchiveMergesMultipleDays(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().In(beijing)
+	// 取 180 天前所在月份的 1/2/3 号：既确保**都超期**（>90 天），
+	// 又确保**同一个月**（对齐到月初，避免连加天数跨月把用例带偏）。
+	old := now.AddDate(0, 0, -180)
+	base := time.Date(old.Year(), old.Month(), 1, 12, 0, 0, 0, beijing)
+	var dates []string
+	for i := 0; i < 3; i++ {
+		dates = append(dates, mkDay(t, dir, base.AddDate(0, 0, i), 2))
+	}
+	archived, removed, err := usageArchiveOlderThan(dir, 90, now)
+	if err != nil {
+		t.Fatalf("归档失败：%v", err)
+	}
+	if archived != 3 || removed != 3 {
+		t.Fatalf("应归档 3 天，got archived=%d removed=%d", archived, removed)
+	}
+	month := dates[0][:7]
+	m, err := usageLoadMonthly(dir, month)
+	if err != nil {
+		t.Fatalf("读月汇总失败：%v", err)
+	}
+	if m.Days != 3 || m.Requests != 6 {
+		t.Errorf("月汇总应合并 3 天 6 请求，got days=%d requests=%d", m.Days, m.Requests)
+	}
+}
+
+// TestArchiveIgnoresJunkFiles 目录里无关文件绝不能被归档逻辑误删。
+func TestArchiveIgnoresJunkFiles(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().In(beijing)
+	mkDay(t, dir, now.AddDate(0, 0, -120), 2)
+	junk := []string{"state.json", "admin-order.json", "usage-notadate.jsonl"}
+	for _, name := range junk {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("{}"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := usageArchiveOlderThan(dir, 90, now); err != nil {
+		t.Fatalf("归档失败：%v", err)
+	}
+	for _, name := range junk {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Errorf("无关文件 %s 不应被删", name)
+		}
+	}
+}
+
+// TestArchiveInvalidDir 空目录/空 dir：安全返回，不 panic。
+func TestArchiveInvalidDir(t *testing.T) {
+	a, r, err := usageArchiveOlderThan("", 90, time.Now())
+	if err != nil || a != 0 || r != 0 {
+		t.Errorf("空 dir 应安全返回，got %d/%d/%v", a, r, err)
+	}
+	// 目录存在但为空
+	a, r, err = usageArchiveOlderThan(t.TempDir(), 90, time.Now())
+	if err != nil || a != 0 || r != 0 {
+		t.Errorf("空目录应无操作，got %d/%d/%v", a, r, err)
 	}
 }

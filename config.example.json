@@ -11,8 +11,11 @@
   },
   "schedule": {
     "checkin_hour": 9,
-    "refresh_hours": [3]
+    "refresh_hours": [
+      3
+    ]
   },
+  "usage_retention_days": 90,
   "upstream": {
     "timeout_seconds": 120,
     "keepalive_seconds": 15

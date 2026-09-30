@@ -19,6 +19,9 @@ services:
       - TW2A_WORK_MODE=${TW2A_WORK_MODE:-auto}
       - TW2A_WORK_BRIDGE_URL=${TW2A_WORK_BRIDGE_URL:-http://host-gateway:7865}
       - TW2A_WORK_BRIDGE_TOKEN=${TW2A_WORK_BRIDGE_TOKEN:-twbridge-local-7f3a}
+      # 日粒度流水保留天数：超期归档成月汇总（保留统计、丢明细）后删除日文件。
+      # 90 = 默认；0 = 不启用（永久保留明细）。每日签到轮次执行一次。
+      - TW2A_USAGE_RETENTION_DAYS=${TW2A_USAGE_RETENTION_DAYS:-90}
     extra_hosts:
       - "host-gateway:host-gateway"
     ports:
