@@ -4,6 +4,7 @@ package server
 import (
 	_ "embed"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -146,6 +147,24 @@ func (h *Handler) adminModels(w http.ResponseWriter, r *http.Request) {
 		ContextLength   int64   `json:"context_length"`
 		ConsumptionRate float64 `json:"consumption_rate"`
 	}
+	// 默认排序：倍率升序（省的在最上），**倍率未知(0)恒定沉底**，并列按 ID 升序。
+	// 未知必须沉底：上游有相当一部分模型不返回 consumption_rate，
+	// 若按数值直接升序，这些 0 值会霸占列表顶部，把真正省的模型挤下去。
+	sortItems := func(items []modelItem) {
+		sort.Slice(items, func(i, j int) bool {
+			ri, rj := items[i].ConsumptionRate, items[j].ConsumptionRate
+			if ri <= 0 && rj > 0 {
+				return false
+			}
+			if ri > 0 && rj <= 0 {
+				return true
+			}
+			if ri != rj {
+				return ri < rj
+			}
+			return items[i].ID < items[j].ID
+		})
+	}
 	dynamic := false
 	if infos := h.fetchDynamicModels(); len(infos) > 0 {
 		dynamic = true
@@ -157,6 +176,7 @@ func (h *Handler) adminModels(w http.ResponseWriter, r *http.Request) {
 			}
 			items = append(items, modelItem{ID: mi.ID, ContextLength: cl, ConsumptionRate: mi.Rate})
 		}
+		sortItems(items)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"fetched_at": time.Now().Format("2006-01-02 15:04:05"),
 			"dynamic":    true,
@@ -171,6 +191,7 @@ func (h *Handler) adminModels(w http.ResponseWriter, r *http.Request) {
 		cl, _ := m["context_length"].(int)
 		items = append(items, modelItem{ID: id, ContextLength: int64(cl), ConsumptionRate: 0})
 	}
+	sortItems(items)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"fetched_at": time.Now().Format("2006-01-02 15:04:05"),
 		"dynamic":    dynamic,
