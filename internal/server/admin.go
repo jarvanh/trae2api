@@ -134,3 +134,46 @@ func (h *Handler) adminCredits(w http.ResponseWriter, r *http.Request) {
 		"accounts":   out,
 	})
 }
+
+// adminModels 返回模型列表 + 上游消耗倍率（供控制台「模型」tab 展示）。
+//
+// 数据源与 /v1/models 同源：modelList() 内部走 fetchDynamicModels()，
+// 命中 1h 缓存时**不产生任何上游请求**；上游失败则回退静态表（此时倍率为 0）。
+// 倍率取自 get_detail_param 内嵌的 consumption_rate.data.rate（如 0.48 = 0.48x）。
+func (h *Handler) adminModels(w http.ResponseWriter, r *http.Request) {
+	type modelItem struct {
+		ID              string  `json:"id"`
+		ContextLength   int64   `json:"context_length"`
+		ConsumptionRate float64 `json:"consumption_rate"`
+	}
+	dynamic := false
+	if infos := h.fetchDynamicModels(); len(infos) > 0 {
+		dynamic = true
+		items := make([]modelItem, 0, len(infos))
+		for _, mi := range infos {
+			cl := mi.ContextWindow
+			if cl == 0 {
+				cl = 131072
+			}
+			items = append(items, modelItem{ID: mi.ID, ContextLength: cl, ConsumptionRate: mi.Rate})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"fetched_at": time.Now().Format("2006-01-02 15:04:05"),
+			"dynamic":    true,
+			"models":     items,
+		})
+		return
+	}
+	// 回退：静态表（不含倍率）
+	items := make([]modelItem, 0, len(staticModels))
+	for _, m := range staticModels {
+		id, _ := m["id"].(string)
+		cl, _ := m["context_length"].(int)
+		items = append(items, modelItem{ID: id, ContextLength: int64(cl), ConsumptionRate: 0})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"fetched_at": time.Now().Format("2006-01-02 15:04:05"),
+		"dynamic":    dynamic,
+		"models":     items,
+	})
+}

@@ -117,6 +117,7 @@
   <div class="tabs">
     <div class="tab active" onclick="switchTab('accounts',this)">账号管理</div>
     <div class="tab" onclick="switchTab('credits',this)">额度监控</div>
+    <div class="tab" onclick="switchTab('models',this)">模型与倍率</div>
   </div>
 
   <!-- 账号管理 -->
@@ -142,6 +143,15 @@
   <!-- 额度监控 -->
   <div id="pane-credits" class="pane">
     <div class="grid" id="grid"><div style="color:var(--dim)"><span class="spin"></span> 切换到「账号管理」tab 查看详情，或点刷新</div></div>
+  </div>
+
+  <!-- 模型与倍率 -->
+  <div id="pane-models" class="pane">
+    <div class="login-bar" style="margin-bottom:12px">
+      <h2>模型列表与消耗倍率</h2>
+      <span id="modelsMeta" style="font-size:12px;color:var(--dim)"></span>
+    </div>
+    <div id="modelTable"><div style="color:var(--dim)"><span class="spin"></span> 加载中...</div></div>
   </div>
 </div>
 
@@ -191,7 +201,40 @@ function switchTab(name, el){
   document.getElementById('pane-'+name).classList.add('active');
   refreshActive();
 }
-function refreshActive(){ if(activeTab==='accounts') loadAccounts(); else loadCredits(); }
+function refreshActive(){
+  if(activeTab==='accounts') loadAccounts();
+  else if(activeTab==='models') loadModels();
+  else loadCredits();
+}
+
+/* ─── 模型与倍率 ─── */
+async function loadModels(){
+  const box = document.getElementById('modelTable');
+  const meta = document.getElementById('modelsMeta');
+  try{
+    const r = await fetch('/admin/api/models', {cache:'no-store'});
+    const d = await r.json();
+    const list = d.models || [];
+    meta.textContent = (d.dynamic ? '实时表' : '静态回退表（上游不可用）')
+      + ' · ' + list.length + ' 个模型 · ' + (d.fetched_at||'');
+    if(!list.length){ box.innerHTML = '<div style="color:var(--dim)">无模型数据</div>'; return; }
+    box.innerHTML = '<table class="accts"><thead><tr>'
+      + '<th>模型 ID</th><th style="width:120px">上下文</th><th style="width:140px">消耗倍率</th>'
+      + '</tr></thead><tbody>'
+      + list.map(m=>{
+          const rate = m.consumption_rate;
+          // 倍率越小越省：≤0.5 绿，≤1 常规，>1 黄（更贵）
+          const cls = rate>0 ? (rate<=0.5?'b-ok':(rate>1?'b-warn':'b-dim')) : 'b-dim';
+          const txt = rate>0 ? rate.toFixed(2)+'x' : '未知';
+          return '<tr><td class="mono">'+esc(m.id)+'</td>'
+            + '<td>'+fmt(m.context_length)+'</td>'
+            + '<td><span class="badge '+cls+'">'+esc(txt)+'</span></td></tr>';
+        }).join('')
+      + '</tbody></table>';
+  }catch(e){
+    box.innerHTML = '<div style="color:var(--bad)">加载失败：'+esc(e.message)+'</div>';
+  }
+}
 
 /* ─── 账号管理 ─── */
 async function loadAccounts(){
