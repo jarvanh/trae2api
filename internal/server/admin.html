@@ -187,10 +187,6 @@
 </div>
 
 <script>
-// 挂载前缀自适应：面板可挂在根路径（/admin）或子路径（/trae/admin）。
-// tailscale serve --set-path=/trae 转发时会剥掉前缀（后端收到的仍是 /admin/...），
-// 但浏览器里的相对请求不会自动带上 —— 故前端自行推导 BASE 拼到 API 路径前。
-const BASE = (location.pathname.match(/^\/(.*)\/admin/) || [null, ''])[1] ? '/' + location.pathname.match(/^\/(.*)\/admin/)[1] : '';
 let activeTab = 'accounts';
 let loginPollTimer = null;
 
@@ -275,7 +271,7 @@ let curAcctIds = [], curCreditIds = [], curModelIds = [];
 // 首次进入页面时拉取已保存顺序（拖动排序的结果），之后 render 才会按它排
 async function loadUIOrder(){
   try{
-    const r = await fetch(BASE+'/admin/api/order', {cache:'no-store'});
+    const r = await fetch('/admin/api/order', {cache:'no-store'});
     if(!r.ok) return;
     const o = await r.json();
     acctOrder = o.accounts || [];
@@ -290,7 +286,7 @@ function dragAttrs(id, idsVar, applyFn){
 }
 
 async function saveOrder(){
-  const r = await fetch(BASE+'/admin/api/order', {
+  const r = await fetch('/admin/api/order', {
     method:'POST',
     headers:{'Content-Type':'application/json', ...authHeader()},
     body: JSON.stringify({accounts: acctOrder, models: modelOrder})
@@ -395,7 +391,7 @@ async function loadModels(){
   const box = document.getElementById('modelTable');
   const meta = document.getElementById('modelsMeta');
   try{
-    const r = await fetch(BASE+'/admin/api/models'+(showInternal?'?all=1':''), {cache:'no-store'});
+    const r = await fetch('/admin/api/models'+(showInternal?'?all=1':''), {cache:'no-store'});
     const d = await r.json();
     modelRows = d.models || [];
     meta.textContent = (d.dynamic ? '实时表' : '静态回退表（上游不可用）')
@@ -410,7 +406,7 @@ async function loadModels(){
 /* ─── 账号管理 ─── */
 async function loadAccounts(){
   try{
-    const r = await fetch(BASE+'/admin/api/accounts', {cache:'no-store'});
+    const r = await fetch('/admin/api/accounts', {cache:'no-store'});
     const d = await r.json();
     renderAccounts(d.accounts||[]);
     document.getElementById('ts').textContent = '更新于 ' + new Date().toLocaleTimeString();
@@ -482,7 +478,7 @@ function setAcctSort(key){
 }
 
 async function toggleAcct(uid, enabled){
-  const r = await fetch(BASE+'/admin/api/accounts/'+encodeURIComponent(uid), {
+  const r = await fetch('/admin/api/accounts/'+encodeURIComponent(uid), {
     method:'PATCH', headers:{'Content-Type':'application/json', ...authHeader()},
     body: JSON.stringify({enabled: enabled})
   });
@@ -490,7 +486,7 @@ async function toggleAcct(uid, enabled){
   loadAccounts();
 }
 async function refreshAcct(uid){
-  const r = await fetch(BASE+'/admin/api/accounts/'+encodeURIComponent(uid)+'/refresh', {
+  const r = await fetch('/admin/api/accounts/'+encodeURIComponent(uid)+'/refresh', {
     method:'POST', headers: authHeader()
   });
   if(!r.ok){ const e = await r.json().catch(()=>({})); alert('刷新失败：'+apiErr(e)); }
@@ -498,14 +494,14 @@ async function refreshAcct(uid){
 }
 async function deleteAcct(uid){
   if(!confirm('确认删除账号 '+uid+'？将同时删除 auths 文件（不可逆）。')) return;
-  const r = await fetch(BASE+'/admin/api/accounts/'+encodeURIComponent(uid), {
+  const r = await fetch('/admin/api/accounts/'+encodeURIComponent(uid), {
     method:'DELETE', headers: authHeader()
   });
   if(!r.ok){ const e = await r.json().catch(()=>({})); alert('删除失败：'+apiErr(e)); }
   loadAccounts();
 }
 async function showJSON(uid){
-  const r = await fetch(BASE+'/admin/api/accounts/'+encodeURIComponent(uid)+'/json', {cache:'no-store'});
+  const r = await fetch('/admin/api/accounts/'+encodeURIComponent(uid)+'/json', {cache:'no-store'});
   const d = await r.json();
   document.getElementById('modalTitle').textContent = '凭证预览（脱敏）— '+(d.nickname||d.uid);
   document.getElementById('modalBody').textContent = JSON.stringify(d, null, 2);
@@ -526,7 +522,7 @@ async function importCred(){
     body = JSON.stringify({callback_url: v}); contentType='application/json';
   }
   try{
-    const r = await fetch(BASE+'/admin/api/accounts/import', {
+    const r = await fetch('/admin/api/accounts/import', {
       method:'POST', headers:{'Content-Type':contentType, ...authHeader()}, body
     });
     const d = await r.json();
@@ -544,7 +540,7 @@ async function startLogin(){
   st.style.display=''; st.className='login-status'; st.textContent='生成登录链接...';
   const btn = document.getElementById('loginBtn'); btn.disabled = true;
   try{
-    const r = await fetch(BASE+'/admin/api/login', {method:'POST', headers:{'Content-Type':'application/json', ...authHeader()}, body:'{}'});
+    const r = await fetch('/admin/api/login', {method:'POST', headers:{'Content-Type':'application/json', ...authHeader()}, body:'{}'});
     const d = await r.json();
     if(!r.ok){ st.className='login-status err'; st.textContent='生成失败：'+apiErr(d); btn.disabled=false; return; }
     st.textContent = '已打开登录窗口，请在浏览器完成手机号登录。完成后此页自动刷新。';
@@ -560,7 +556,7 @@ function pollLogin(pid){
     waited += 2;
     if(waited > 180){ clearInterval(loginPollTimer); st.className='login-status err'; st.textContent='登录超时（3分钟），请重试'; document.getElementById('loginBtn').disabled=false; return; }
     try{
-      const r = await fetch(BASE+'/admin/api/login/result?pending_id='+encodeURIComponent(pid), {cache:'no-store'});
+      const r = await fetch('/admin/api/login/result?pending_id='+encodeURIComponent(pid), {cache:'no-store'});
       const d = await r.json();
       if(d.state==='success'){
         clearInterval(loginPollTimer);
@@ -655,7 +651,7 @@ function renderCredits(d){
 }
 async function loadCredits(){
   try{
-    const r = await fetch(BASE+'/admin/api/credits', {cache:'no-store'});
+    const r = await fetch('/admin/api/credits', {cache:'no-store'});
     renderCredits(await r.json());
   }catch(e){
     document.getElementById('grid').innerHTML = '<div style="color:var(--bad)">加载失败：'+esc(e.message)+'</div>';
