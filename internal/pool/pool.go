@@ -150,7 +150,6 @@ type Pool struct {
 	stateFp     string
 	affinity    map[string]affinityEntry
 	affinityTTL time.Duration
-	maxInFlight int
 }
 
 type affinityEntry struct {
@@ -165,27 +164,11 @@ func New(stateFp string) *Pool {
 		stateFp:     stateFp,
 		affinity:    map[string]affinityEntry{},
 		affinityTTL: 30 * time.Minute,
-		maxInFlight: 3,
 	}
 	if stateFp != "" {
 		p.load()
 	}
 	return p
-}
-
-// SetMaxInFlight 设置单账号最大并发在途请求数（<=0 表示不限制）。
-func (p *Pool) SetMaxInFlight(n int) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.maxInFlight = n
-}
-
-// inFlightFull 报告账号是否已占满在途名额（maxInFlight<=0 时恒 false）。
-func (p *Pool) inFlightFull(e *entry) bool {
-	if p.maxInFlight <= 0 {
-		return false
-	}
-	return e.inFlight >= p.maxInFlight
 }
 
 // Acquire 尝试为指定账号获取在途并发名额（无论是否满载均计数，调用方需注意配合 Release）。
@@ -368,21 +351,7 @@ func (p *Pool) pickBestCandidateLocked(tried map[string]bool, now time.Time) *en
 		if !e.healthy(now) {
 			continue
 		}
-		if p.inFlightFull(e) {
-			continue
-		}
 		ces = append(ces, uidEntry{uid: uid, e: e})
-	}
-	// 若全部健康账号均占满在途并发，放宽在途限制
-	if len(ces) == 0 {
-		for uid, e := range p.byUID {
-			if tried != nil && tried[uid] {
-				continue
-			}
-			if e.healthy(now) {
-				ces = append(ces, uidEntry{uid: uid, e: e})
-			}
-		}
 	}
 	if len(ces) == 0 {
 		return nil
@@ -425,11 +394,11 @@ func (p *Pool) PickAffinity(sessionKey string, tried map[string]bool) *auth.Auth
 	defer p.mu.Unlock()
 	now := time.Now()
 
-	// 1. 若提供了 sessionKey，优先复用健康的已有绑定账号（且未占满在途并发）
+	// 1. 若提供了 sessionKey，优先复用健康的已有绑定账号
 	if sessionKey != "" {
 		if aff, ok := p.affinity[sessionKey]; ok {
 			if tried == nil || !tried[aff.uid] {
-				if e, exists := p.byUID[aff.uid]; exists && e.healthy(now) && !p.inFlightFull(e) {
+				if e, exists := p.byUID[aff.uid]; exists && e.healthy(now) {
 					aff.lastSeen = now
 					p.affinity[sessionKey] = aff
 					e.lastUsed = now

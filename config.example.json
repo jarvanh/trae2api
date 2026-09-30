@@ -15,7 +15,6 @@
   },
   "upstream": {
     "timeout_seconds": 120,
-    "max_in_flight": 3,
     "keepalive_seconds": 15
   }
 }

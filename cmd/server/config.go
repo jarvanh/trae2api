@@ -39,14 +39,6 @@ type Config struct {
 
 	Upstream struct {
 		TimeoutSeconds int `json:"timeout_seconds"` // 120
-		// MaxInFlight 单账号最大并发在途请求数（<=0 = 不限制）。
-		//
-		// 注意：上游并不限制并发——实测 12 路并发 12/12 全 200、无一被拒，
-		// 拥堵只体现为「排队变久」（最慢/最快约 1.6x），不会返回 429。
-		// 因此本项不是削峰手段：调小它并不能帮上游减负（请求照样发上去、上游照样全收），
-		// 只会额外加一层本地排队、凭空增加延迟。它的作用仅是防止单个账号被本进程
-		// 并发打满（本地自我保护），拥堵场景下无需特意调小。
-		MaxInFlight int `json:"max_in_flight"` // 0 = 沿用 pool 默认（3）
 		// KeepaliveSeconds 流式响应在「首个真实帧到达前」的心跳间隔（SSE 注释帧 `: ping`）。
 		// 用于防止边缘网关（volc-dcdn/tengine）因长排队窗口连接静默而提前掐断（502）。
 		// 0 = 关闭心跳（等同旧行为）。
@@ -183,7 +175,6 @@ func (c *Config) normalize() error {
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120
 	}
-	// MaxInFlight <= 0 → 沿用 pool 默认（3），不调用 SetMaxInFlight 覆盖。
 	// KeepaliveSeconds 未设置（0）→ 默认 15s 开启心跳；负数 → 显式关闭。
 	if c.Upstream.KeepaliveSeconds < 0 {
 		c.Upstream.KeepaliveSeconds = 0

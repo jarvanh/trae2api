@@ -35,9 +35,6 @@ func main() {
 
 	p := pool.New(cfg.StateFile)
 	p.SyncToDir(auths) // 对齐：剔除 state.json 中已删除 auth 文件的幽灵账号
-	if cfg.Upstream.MaxInFlight > 0 {
-		p.SetMaxInFlight(cfg.Upstream.MaxInFlight)
-	}
 
 	up := upstream.New()
 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
