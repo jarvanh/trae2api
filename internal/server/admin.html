@@ -105,6 +105,20 @@
   .spin { display:inline-block; width:12px; height:12px; border:2px solid var(--card2); border-top-color:var(--accent);
           border-radius:50%; animation:sp .8s linear infinite; vertical-align:-2px; }
   @keyframes sp { to { transform:rotate(360deg); } }
+  /* 请求流水：汇总卡片 + 24h 柱状图 */
+  .ucard { background:var(--card); border:1px solid #232836; border-radius:12px; padding:16px 18px; margin-bottom:14px; }
+  .ustats { display:grid; grid-template-columns:repeat(auto-fit,minmax(112px,1fr)); gap:12px; }
+  .ustat { text-align:center; }
+  .ustat-v { font-size:20px; font-weight:700; font-variant-numeric:tabular-nums; }
+  .ustat-v.ok { color:var(--ok); } .ustat-v.bad { color:var(--bad); }
+  .ustat-v.warn { color:var(--warn); } .ustat-v.dim { color:var(--dim); }
+  .ustat-l { font-size:11px; color:var(--dim); margin-top:3px; }
+  .ubars { margin-top:16px; border-top:1px solid #232836; padding-top:12px; }
+  .ubars-t { font-size:12px; color:var(--dim); margin-bottom:8px; }
+  .ubars-row { display:flex; align-items:flex-end; gap:2px; height:64px; }
+  .ubar-col { flex:1; display:flex; flex-direction:column; justify-content:flex-end; height:100%; }
+  .ubar { background:var(--accent); border-radius:2px 2px 0 0; min-height:1px; }
+  .ubar-h { font-size:9px; color:var(--dim); text-align:center; margin-top:3px; font-variant-numeric:tabular-nums; }
 </style>
 </head>
 <body>
@@ -129,6 +143,7 @@
     <div class="tab active" onclick="switchTab('accounts',this)">账号管理</div>
     <div class="tab" onclick="switchTab('credits',this)">额度监控</div>
     <div class="tab" onclick="switchTab('models',this)">模型与倍率</div>
+    <div class="tab" onclick="switchTab('usage',this)">请求流水</div>
   </div>
 
   <!-- 账号管理 -->
@@ -174,6 +189,37 @@
       <span class="hint">默认隐藏 custom_model_* / *_subagent / summary 等内部配置</span>
     </div>
     <div id="modelTable"><div style="color:var(--dim)"><span class="spin"></span> 加载中...</div></div>
+  </div>
+
+  <!-- 请求流水 -->
+  <div id="pane-usage" class="pane">
+    <div class="login-bar" style="margin-bottom:12px">
+      <h2>请求流水</h2>
+      <span id="usageMeta" style="font-size:12px;color:var(--dim)"></span>
+    </div>
+    <div class="orderbar">
+      <span>日期</span>
+      <input type="date" id="usageDate" onchange="loadUsage()" style="background:var(--card);border:1px solid #2a2f3a;border-radius:6px;color:var(--fg);padding:4px 8px;font-size:12px">
+      <button class="btn sm" onclick="shiftUsageDate(-1)">前一天</button>
+      <button class="btn sm" onclick="shiftUsageDate(1)">后一天</button>
+      <button class="btn sm" onclick="setUsageDate(todayStr())">今天</button>
+      <span style="margin-left:8px">流量</span>
+      <select id="usageProbe" onchange="loadUsage()" style="background:var(--card);border:1px solid #2a2f3a;border-radius:6px;color:var(--fg);padding:4px 8px;font-size:12px">
+        <option value="all">全部</option>
+        <option value="real">仅真实</option>
+        <option value="probe">仅探测</option>
+      </select>
+      <span style="margin-left:8px">条数</span>
+      <select id="usageLimit" onchange="loadUsage()" style="background:var(--card);border:1px solid #2a2f3a;border-radius:6px;color:var(--fg);padding:4px 8px;font-size:12px">
+        <option value="50">50</option>
+        <option value="200" selected>200</option>
+        <option value="500">500</option>
+        <option value="1000">1000</option>
+      </select>
+      <button class="btn sm" onclick="loadUsage()">刷新</button>
+    </div>
+    <div id="usageSummary"></div>
+    <div id="usageTable"><div style="color:var(--dim)"><span class="spin"></span> 加载中...</div></div>
   </div>
 </div>
 
@@ -331,7 +377,146 @@ function switchTab(name, el){
 function refreshActive(){
   if(activeTab==='accounts') loadAccounts();
   else if(activeTab==='models') loadModels();
+  else if(activeTab==='usage') loadUsage();
   else loadCredits();
+}
+
+/* ─── 请求流水 ─── */
+// todayStr 返回**北京时区**的今天（YYYY-MM-DD）。
+// 不能用 toISOString().slice(0,10)：那是 UTC 日期，北京 08:00 前会算成前一天，
+// 与后端按北京自然日切分的 usage 文件错位。
+function todayStr(){
+  const d = new Date();
+  // 北京 = UTC+8：先按 UTC 取值再手动加 8 小时，避免依赖运行环境的本地时区
+  const bj = new Date(d.getTime() + 8*3600*1000);
+  const p = n => String(n).padStart(2,'0');
+  return bj.getUTCFullYear()+'-'+p(bj.getUTCMonth()+1)+'-'+p(bj.getUTCDate());
+}
+function shiftUsageDate(delta){
+  const cur = document.getElementById('usageDate').value || todayStr();
+  const d = new Date(cur+'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate()+delta);
+  document.getElementById('usageDate').value = d.toISOString().slice(0,10);
+  loadUsage();
+}
+function setUsageDate(v){
+  document.getElementById('usageDate').value = v;
+  loadUsage();
+}
+(async function initUsageDate(){
+  document.getElementById('usageDate').value = todayStr();
+})();
+
+// fmtDur 耗时展示：<1000ms 用 ms，超过用 s（保留 1 位），>=60s 用 m。
+function fmtDur(ms){
+  if(!ms && ms!==0) return '-';
+  if(ms < 1000) return ms+'ms';
+  if(ms < 60000) return (ms/1000).toFixed(1)+'s';
+  return (ms/60000).toFixed(1)+'m';
+}
+
+let usageRows = [];
+async function loadUsage(){
+  const box = document.getElementById('usageTable');
+  const meta = document.getElementById('usageMeta');
+  const date = document.getElementById('usageDate').value || todayStr();
+  const probe = document.getElementById('usageProbe').value;
+  const limit = document.getElementById('usageLimit').value;
+  box.innerHTML = '<div style="color:var(--dim)"><span class="spin"></span> 加载中...</div>';
+  try{
+    const r = await fetch('/admin/api/usage?date='+encodeURIComponent(date)
+      +'&probe='+encodeURIComponent(probe)+'&limit='+encodeURIComponent(limit), {cache:'no-store'});
+    const d = await r.json();
+    if(!r.ok){ box.innerHTML = '<div style="color:var(--bad)">加载失败：'+esc(apiErr(d))+'</div>'; return; }
+    usageRows = d.entries || [];
+    renderUsageSummary(d);
+    renderUsageTable();
+    meta.textContent = '数据源 '+esc(d.usage_dir||'-')+'/usage-'+esc(d.date)+'.jsonl · '+(d.fetched_at||'');
+    if(d.warn && d.warn.length){
+      meta.textContent += ' · ⚠️ '+esc(d.warn.join('；'));
+    }
+  }catch(e){
+    box.innerHTML = '<div style="color:var(--bad)">加载失败：'+esc(e.message)+'</div>';
+  }
+}
+
+function renderUsageSummary(d){
+  const el = document.getElementById('usageSummary');
+  const a = d.agg || {};
+  const req = a.requests||0, errs = a.errors||0;
+  const ok = req - errs;
+  const rate = req ? (ok/req*100) : 0;
+  const hours = a.by_hour || [];
+  const maxH = Math.max(1, ...hours);
+  // 24 小时柱状图（CSS 高度百分比，零依赖）
+  let bars = '';
+  for(let h=0; h<24; h++){
+    const v = hours[h]||0;
+    const pct = v ? Math.max(2, Math.round(v/maxH*100)) : 0;
+    bars += '<div class="ubar-col" title="'+h+':00  '+v+' 次">'
+      + '<div class="ubar" style="height:'+pct+'%"></div>'
+      + '<div class="ubar-h">'+((h%3===0)?h:'')+'</div></div>';
+  }
+  const stat = (label, val, cls) => '<div class="ustat"><div class="ustat-v '+(cls||'')+'">'+val+'</div><div class="ustat-l">'+label+'</div></div>';
+  el.innerHTML = '<div class="ucard">'
+    + '<div class="ustats">'
+    + stat('总请求', fmt(req))
+    + stat('成功', fmt(ok), 'ok')
+    + stat('失败', fmt(errs), errs? 'bad':'dim')
+    + stat('成功率', req? rate.toFixed(1)+'%':'-', errs? 'warn':'ok')
+    + stat('真实/探测', fmt(a.real||0)+' / '+fmt(a.probe||0))
+    + stat('输入 token', fmt(a.in||0))
+    + stat('输出 token', fmt(a.out||0))
+    + '</div>'
+    + '<div class="ubars"><div class="ubars-t">24 小时分布（北京时间）</div><div class="ubars-row">'+bars+'</div></div>'
+    + '</div>';
+}
+
+function renderUsageTable(){
+  const box = document.getElementById('usageTable');
+  if(!usageRows.length){
+    box.innerHTML = '<div style="color:var(--dim);padding:14px">当天没有请求记录。</div>';
+    return;
+  }
+  const rows = usageRows.map(e=>{
+    const ok = (e.status===undefined || e.status===0) ? true : (e.status>=200 && e.status<300);
+    const stCls = !ok ? 'b-bad' : 'b-ok';
+    const stTxt = (e.status===undefined || e.status===0) ? (ok?'200':'-') : String(e.status);
+    const probeTag = e.probe ? ' <span class="badge b-dim">探测</span>' : '';
+    const modeTag = e.mode ? '<span class="badge b-dim">'+esc(e.mode)+'</span>' : '';
+    const tok = (e.in||e.out) ? (fmt(e.in||0)+' / '+fmt(e.out||0)) : '-';
+    const uid = e.uid ? '<span class="mono">'+esc(String(e.uid).slice(0,8))+'</span>' : '-';
+    const err = e.err ? '<div class="mono" style="color:var(--bad);margin-top:4px">'+esc(e.err)+'</div>' : '';
+    return '<tr>'
+      + '<td class="mono">'+esc(fmtTime(e.t))+'</td>'
+      + '<td class="mono">'+esc(e.model||'-')+'</td>'
+      + '<td>'+uid+'</td>'
+      + '<td><span class="badge '+stCls+'">'+esc(stTxt)+'</span>'+probeTag+'</td>'
+      + '<td>'+modeTag+'</td>'
+      + '<td class="mono">'+fmtDur(e.ms)+'</td>'
+      + '<td class="mono">'+(e.ttfb?fmtDur(e.ttfb):'-')+'</td>'
+      + '<td class="mono">'+tok+'</td>'
+      + '<td>'+(err||'')+'</td>'
+      + '</tr>';
+  }).join('');
+  box.innerHTML = '<table class="accts"><thead><tr>'
+    + '<th style="width:96px">时间</th>'
+    + '<th>模型</th>'
+    + '<th style="width:110px">账号</th>'
+    + '<th style="width:110px">状态</th>'
+    + '<th style="width:100px">通道</th>'
+    + '<th style="width:80px">耗时</th>'
+    + '<th style="width:80px">首字节</th>'
+    + '<th style="width:130px">输入/输出</th>'
+    + '<th>错误</th>'
+    + '</tr></thead><tbody>'+rows+'</tbody></table>';
+}
+// fmtTime 把 unix 秒渲染成北京时间 HH:MM:SS（与后端按北京日切分保持一致）
+function fmtTime(sec){
+  if(!sec) return '-';
+  const d = new Date(sec*1000 + 8*3600*1000);
+  const p = n => String(n).padStart(2,'0');
+  return p(d.getUTCHours())+':'+p(d.getUTCMinutes())+':'+p(d.getUTCSeconds());
 }
 
 /* ─── 模型与倍率 ─── */

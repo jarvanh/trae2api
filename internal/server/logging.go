@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -28,7 +29,8 @@ type chatStat struct {
 	toks   int // <0 表示 usage 缺失 → 显示 "-"
 	status int
 
-	logged bool
+	logged      bool
+	usageLogged bool // 本次请求已在成功路径落过用量账（避免失败兜底重复写一行）
 }
 
 // newChatStat 以请求进入 handler 的时刻为起点构造统计对象；toks 默认 -1（usage 缺失）。
@@ -47,6 +49,63 @@ func (s *chatStat) done() {
 	}
 	s.logged = true
 	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks)
+}
+
+// msSince 返回从 s.start 到现在的耗时（毫秒）。
+// s 为 nil 或 start 为零值时返回 0 —— 用量流水是 best-effort 旁路，
+// 宁可记 0 也不能让记账逻辑 panic 或反向影响主流程。
+func msSince(s *chatStat) int64 {
+	if s == nil || s.start.IsZero() {
+		return 0
+	}
+	return time.Since(s.start).Milliseconds()
+}
+
+// noteUsage 在成功路径落一次用量账并打标。
+//
+// 必须经由它（而非直接 recordUsage）记账：请求出口有「失败兜底」逻辑，
+// 靠 usageLogged 判断这次请求是否已被成功路径记过；漏打标会让成功的请求
+// 被再补一行「失败」记录，把面板的成功率与吞吐量都算错。
+func noteUsage(s *chatStat, rec usageRecord) {
+	if s != nil {
+		s.usageLogged = true
+	}
+	recordUsage(rec)
+}
+
+// recordFailure 失败请求兜底记账：成功路径已通过 noteUsage 落账的请求会跳过。
+//
+// 为什么必须补这一层：原实现只在拿到 token 的成功路径落盘，失败请求
+// （上游 502/超时/全部账号冷却/参数错误）完全不入账 —— 面板看到的吞吐量
+// 会明显虚低，而排障时最关键的错误样本恰好是缺的那一批。
+//
+// 仍遵循 best-effort：只追加一行，绝不改变已写出的响应。
+func (h *Handler) recordFailure(r *http.Request, st *chatStat, lastErr error) {
+	if st == nil || st.usageLogged || h.cfg.UsageDir == "" {
+		return
+	}
+	status := st.status
+	if status >= 200 && status < 300 {
+		return // 成功却没记过账（理论上不该发生）：宁可不记，也不能误写成失败
+	}
+	if status == 0 {
+		status = http.StatusInternalServerError // 未走到写响应：异常出口
+	}
+	var errMsg string
+	if lastErr != nil {
+		errMsg = lastErr.Error()
+	}
+	recordUsage(usageRecord{
+		Dir:    h.cfg.UsageDir,
+		Model:  st.model,
+		Probe:  isProbeRequest(r),
+		UID:    st.uid,
+		Status: status,
+		Mode:   st.mode,
+		Ms:     msSince(st),
+		TTFB:   st.ttfb.Milliseconds(),
+		Err:    errMsg,
+	})
 }
 
 // soloStatsReader 解析原生 SOLO SSE（event:/data: 双行），记录首个 output 事件的

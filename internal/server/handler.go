@@ -108,6 +108,8 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /admin", h.adminPage)
 	h.mux.HandleFunc("GET /admin/api/credits", h.adminCredits)
 	h.mux.HandleFunc("GET /admin/api/models", h.adminModels)
+	// 请求流水：读 usage-<日期>.jsonl 明细 + 聚合（只读，无鉴权）
+	h.mux.HandleFunc("GET /admin/api/usage", h.adminUsage)
 	// 控制台拖动排序：GET 读已保存顺序，POST 保存（写操作需 Bearer = TW2A_API_KEY）
 	h.mux.HandleFunc("GET /admin/api/order", h.adminGetOrder)
 	h.mux.HandleFunc("POST /admin/api/order", h.withAdminAuth(h.adminSaveOrder))
@@ -433,6 +435,7 @@ func extractSessionKey(r *http.Request, body []byte) string {
 }
 
 // executeWorkRequest 使用账号池多账号动态轮转调度执行 Work 通道请求。
+// st 为请求级统计对象（可为 nil）：命中账号时写回 st.uid，供用量流水记录消费账号。
 // 调度与容灾策略：
 // 1. 检查 Work 通道是否被 TW2A_WORK_MODE=disabled 禁用；
 // 2. 根据可用 work_credits 降序择优选取健康账号（支持 sessionKey 会话粘性，排除已尝试过的账号）；
@@ -440,7 +443,7 @@ func extractSessionKey(r *http.Request, body []byte) string {
 // 4. 发起 ChatStream 调用（在 Auto 模式下优先 Native 直连，失败平滑降级 Bridge）；
 // 5. 若发生故障（网络错误/429限流/401会话失效/额度不足），进入 pool 对应冷却/禁用状态机，并自动轮转下一账号；
 // 6. 成功响应后，异步触发积分探测，更新账号 work_credits 状态。
-func (h *Handler) executeWorkRequest(w http.ResponseWriter, r *http.Request, body []byte, model string, stream bool, sessionKey string) (bool, error) {
+func (h *Handler) executeWorkRequest(w http.ResponseWriter, r *http.Request, body []byte, model string, stream bool, sessionKey string, st *chatStat) (bool, error) {
 	if h.cfg.WorkMode == upstream.WorkModeDisabled || (h.cfg.WorkClient != nil && h.cfg.WorkClient.Mode() == upstream.WorkModeDisabled) {
 		return false, errors.New("work channel is disabled by configuration (TW2A_WORK_MODE=disabled)")
 	}
@@ -459,6 +462,9 @@ func (h *Handler) executeWorkRequest(w http.ResponseWriter, r *http.Request, bod
 			break
 		}
 		tried[acct.UID] = true
+		if st != nil {
+			st.uid = acct.UID
+		}
 
 		refreshed, err := h.cfg.Upstream.RefreshTokenIfNeeded(acct, h.cfg.RefreshSkew)
 		if err != nil {
@@ -513,7 +519,11 @@ func (h *Handler) executeWorkRequest(w http.ResponseWriter, r *http.Request, bod
 			_ = upstream.StreamWorkToOpenAI(w, rc, model, "")
 			_ = rc.Close()
 			// Work 流式拿不到 token 明细，记 0/0 仅保留探测/真实分流计数
-			recordUsage(h.cfg.UsageDir, model, isProbeRequest(r), 0, 0)
+			noteUsage(st, usageRecord{
+				Dir: h.cfg.UsageDir, Model: model, Probe: isProbeRequest(r), UID: acct.UID,
+				Status: http.StatusOK, Mode: "work-stream",
+				Ms: msSince(st),
+			})
 			return true, nil
 		}
 
@@ -524,7 +534,11 @@ func (h *Handler) executeWorkRequest(w http.ResponseWriter, r *http.Request, bod
 			h.cfg.Pool.NoteWorkError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
 			continue
 		}
-		recordUsage(h.cfg.UsageDir, model, isProbeRequest(r), promptTokens(resp), completionTokens(resp))
+		noteUsage(st, usageRecord{
+			Dir: h.cfg.UsageDir, Model: model, Probe: isProbeRequest(r), UID: acct.UID,
+			Status: http.StatusOK, Mode: "work-sync", In: promptTokens(resp), Out: completionTokens(resp),
+			Ms: msSince(st),
+		})
 		writeJSON(w, http.StatusOK, resp)
 		return true, nil
 	}
@@ -556,7 +570,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 请求级统计：出口打印表格日志
 	st := newChatStat(time.Now(), body, peek.Stream)
-	defer st.done()
+	// lastErr 提前声明：出口兜底记账的 defer 要读它（成功路径已落账则跳过）
+	var lastErr error
+	defer func() {
+		st.done()
+		h.recordFailure(r, st, lastErr)
+	}()
 
 	sessionKey := extractSessionKey(r, body)
 
@@ -584,7 +603,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, http.StatusForbidden, "work_disabled", "work channel is disabled by configuration (TW2A_WORK_MODE=disabled)")
 			return
 		}
-		handled, err := h.executeWorkRequest(w, r, body, configName, peek.Stream, sessionKey)
+		handled, err := h.executeWorkRequest(w, r, body, configName, peek.Stream, sessionKey, st)
 		if !handled {
 			st.status = http.StatusServiceUnavailable
 			msg := "all accounts unavailable for work channel"
@@ -614,7 +633,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tried := map[string]bool{}
-	var lastErr error
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		acct := h.cfg.Pool.PickAffinity(sessionKey, tried)
 		if acct == nil {
@@ -668,7 +686,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			case upstream.ErrPlanLimit:
 				h.cfg.Pool.Cooldown(acct.UID, pool.CoolPlan, h.cfg.PlanCooldown, "plan 权益不足")
 				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
-				if handled, _ := h.executeWorkRequest(w, r, body, configName, peek.Stream, sessionKey); handled {
+				if handled, _ := h.executeWorkRequest(w, r, body, configName, peek.Stream, sessionKey, st); handled {
 					st.status = http.StatusOK
 					return
 				}
@@ -717,7 +735,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			st.ttfb = statsR.TTFB()
 			// 用量落盘：流式拿不到输入 tokens，记 completion 数（探测/真实分流足够）
-			recordUsage(h.cfg.UsageDir, peek.Model, probe, 0, max(st.toks, 0))
+			noteUsage(st, usageRecord{
+				Dir: h.cfg.UsageDir, Model: peek.Model, Probe: probe, UID: acct.UID,
+				Status: http.StatusOK, Mode: "stream", Out: max(st.toks, 0),
+				Ms: msSince(st), TTFB: st.ttfb.Milliseconds(),
+			})
 			return
 		}
 		resp, err := upstream.Aggregate(rc)
@@ -744,12 +766,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.cfg.Pool.RecordSuccess(acct.UID)
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
-		recordUsage(h.cfg.UsageDir, peek.Model, probe, promptTokens(resp), max(st.toks, 0))
+		noteUsage(st, usageRecord{
+			Dir: h.cfg.UsageDir, Model: peek.Model, Probe: probe, UID: acct.UID,
+			Status: http.StatusOK, Mode: "sync", In: promptTokens(resp), Out: max(st.toks, 0),
+			Ms: msSince(st),
+		})
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 	// 所有账号耗尽/冷却，尝试 Work 通道兜底消费 work_credits
-	if handled, _ := h.executeWorkRequest(w, r, body, configName, peek.Stream, sessionKey); handled {
+	if handled, _ := h.executeWorkRequest(w, r, body, configName, peek.Stream, sessionKey, st); handled {
 		st.status = http.StatusOK
 		return
 	}

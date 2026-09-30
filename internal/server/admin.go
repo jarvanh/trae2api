@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -325,6 +326,60 @@ func reorderBy(ids []string, order []string) []string {
 // adminGetOrder 返回已保存的控制台顺序（读接口，无鉴权）。
 func (h *Handler) adminGetOrder(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, h.loadUIOrder())
+}
+
+// adminUsage 请求流水：读取某天（默认北京今天）的 usage jsonl，
+// 返回明细（新→旧）+ 全量聚合（请求数/成功失败/token/按模型/按小时）。
+//
+// 只读接口，无鉴权（与 credits/models 一致，局域网内面板）。
+// 参数：
+//   - date  ：北京日期 YYYY-MM-DD，默认今天
+//   - limit ：明细条数上限，默认 200（最大 1000）
+//   - probe ：all(默认) | real | probe，过滤探测/真实流量
+func (h *Handler) adminUsage(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	date := strings.TrimSpace(q.Get("date"))
+	if date == "" {
+		date = time.Now().In(beijing).Format("2006-01-02")
+	}
+	// 日期格式校验：只允许 YYYY-MM-DD，避免路径穿越（date 会拼进文件名）
+	if _, err := time.Parse("2006-01-02", date); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "date 需为 YYYY-MM-DD"})
+		return
+	}
+	limit := 200
+	if v := strings.TrimSpace(q.Get("limit")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+
+	entries, agg, warn := usageScan(h.cfg.UsageDir, date, limit)
+
+	// 探测/真实过滤（过滤只影响明细，聚合仍是全量 —— 全量口径更有参考价值）
+	probeFilter := strings.ToLower(strings.TrimSpace(q.Get("probe")))
+	if probeFilter == "probe" || probeFilter == "real" {
+		want := probeFilter == "probe"
+		kept := entries[:0]
+		for _, e := range entries {
+			if e.Probe == want {
+				kept = append(kept, e)
+			}
+		}
+		entries = kept
+	}
+
+	if entries == nil {
+		entries = []usageEntry{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"date":       date,
+		"fetched_at": time.Now().In(beijing).Format("2006-01-02 15:04:05"),
+		"entries":    entries,
+		"agg":        agg,
+		"warn":       warn,
+		"usage_dir":  h.cfg.UsageDir,
+	})
 }
 
 // adminSaveOrder 保存控制台拖动排序结果（写操作，需 Bearer 鉴权）。
