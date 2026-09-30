@@ -260,7 +260,8 @@ func isInternalModel(id string) bool {
 	if strings.HasPrefix(id, "custom_model_") {
 		return true
 	}
-	if strings.HasSuffix(id, "_subagent") || strings.HasSuffix(id, "_agent") {
+	// 用子串而非后缀：explore_sub_agent_v2 这类带版本后缀的，后缀判定会漏网
+	if strings.Contains(id, "_subagent") || strings.Contains(id, "_agent") {
 		return true
 	}
 	return id == "summary"
