@@ -155,7 +155,7 @@ curl -X POST http://127.0.0.1:7864/v1/chat/completions \
 | `TW2A_DEFAULT_MODEL` | `glm-5.2` | 默认回退请求模型 |
 | `TW2A_CALLBACK_PORT` | `18080` | 本地 OAuth 回调端口（设为 0 可关闭） |
 | `TW2A_TIMEOUT_SECONDS` | `120` | 上游请求超时时长（秒） |
-| `TW2A_MAX_IN_FLIGHT` | `3` | 单账号最大并发在途请求数（`<=0` 不限制；拥堵窗口调小可摊平流量） |
+| `TW2A_MAX_IN_FLIGHT` | `3` | 单账号最大并发在途请求数（`<=0` 不限制）。**非削峰手段**：实测上游不限并发（12 路并发 12/12 全 200，拥堵仅表现为排队变久），调小它不帮上游减负，只会加一层本地排队 |
 | `TW2A_KEEPALIVE_SECONDS` | `15` | 流式响应首帧到达前的 SSE 心跳间隔（秒），`0` 或负数关闭 |
 | `TW2A_ERR_THRESHOLD` | `3` | 触发冷却前的连续错误次数 |
 | `TW2A_ERR_COOLDOWN` | `300` | 错误冷却时长（秒） |
