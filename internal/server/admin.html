@@ -5,8 +5,19 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>trae2api 控制台</title>
 <style>
+  /* 深色（默认） */
   :root { --bg:#0f1115; --card:#171a21; --card2:#1d212b; --fg:#e6e9ef; --dim:#8a93a6;
-          --ok:#3fb96b; --warn:#e0a33e; --bad:#e05d5d; --accent:#4d9fff; }
+          --ok:#3fb96b; --warn:#e0a33e; --bad:#e05d5d; --accent:#4d9fff;
+          --border:#2a2f3a; --border2:#232836; --accent-soft:#1c3a5a; --chip:#22262f;
+          --ok-bg:#173a26; --warn-bg:#3a2d13; --bad-bg:#3a1717;
+          --danger-border:#5a2a2a; --overlay:rgba(0,0,0,.6); }
+  /* 亮色 */
+  :root[data-theme="light"] { --bg:#f4f6fa; --card:#ffffff; --card2:#eef1f6; --fg:#1a1d23; --dim:#5f6878;
+          --ok:#1a7f42; --warn:#966200; --bad:#c0392b; --accent:#1a6fd4;
+          --border:#d3d9e2; --border2:#e3e7ee; --accent-soft:#dbeafe; --chip:#e8ebf1;
+          --ok-bg:#dcf5e4; --warn-bg:#fdf1d6; --bad-bg:#fbe0e0;
+          --danger-border:#e0a9a9; --overlay:rgba(15,17,21,.35); }
+  body { transition:background-color .15s, color .15s; }
   * { margin:0; padding:0; box-sizing:border-box; }
   body { background:var(--bg); color:var(--fg); font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif; min-height:100vh; }
   .wrap { max-width:1100px; margin:0 auto; padding:28px 20px 60px; }
@@ -14,38 +25,38 @@
   h1 { font-size:22px; font-weight:600; letter-spacing:.3px; }
   h1 small { color:var(--dim); font-weight:400; font-size:13px; margin-left:8px; }
   .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-  .btn { background:var(--card2); color:var(--fg); border:1px solid #2a2f3a; border-radius:8px;
+  .btn { background:var(--card2); color:var(--fg); border:1px solid var(--border); border-radius:8px;
          padding:8px 16px; font-size:13px; cursor:pointer; transition:.15s; }
   .btn:hover { border-color:var(--accent); color:var(--accent); }
-  .btn.primary { background:#1c3a5a; border-color:var(--accent); color:var(--accent); }
-  .btn.danger { border-color:#5a2a2a; }
+  .btn.primary { background:var(--accent-soft); border-color:var(--accent); color:var(--accent); }
+  .btn.danger { border-color:var(--danger-border); }
   .btn.danger:hover { color:var(--bad); border-color:var(--bad); }
   .btn.sm { padding:4px 10px; font-size:12px; }
   #ts { color:var(--dim); font-size:12px; }
   /* tabs */
-  .tabs { display:flex; gap:6px; margin-bottom:18px; border-bottom:1px solid #232836; }
+  .tabs { display:flex; gap:6px; margin-bottom:18px; border-bottom:1px solid var(--border2); }
   .tab { padding:8px 16px; font-size:13px; cursor:pointer; color:var(--dim); border-bottom:2px solid transparent; }
   .tab.active { color:var(--fg); border-bottom-color:var(--accent); }
   .pane { display:none; }
   .pane.active { display:block; }
   /* key bar */
   .keybar { display:flex; gap:8px; align-items:center; margin-bottom:14px; font-size:12px; color:var(--dim); flex-wrap:wrap; }
-  .keybar input { background:var(--card); border:1px solid #2a2f3a; border-radius:6px; color:var(--fg);
+  .keybar input { background:var(--card); border:1px solid var(--border); border-radius:6px; color:var(--fg);
                   padding:5px 10px; font-size:12px; width:200px; font-family:Consolas,monospace; }
   .keybar .saved { color:var(--ok); font-size:11px; }
   /* credits grid */
   .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); gap:14px; }
-  .card { background:var(--card); border:1px solid #232836; border-radius:12px; padding:18px 18px 14px; }
+  .card { background:var(--card); border:1px solid var(--border2); border-radius:12px; padding:18px 18px 14px; }
   .card.err { border-color:var(--bad); }
   .card-top { display:flex; justify-content:space-between; align-items:flex-start; gap:8px; }
   .nick { font-size:15px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .uid { color:var(--dim); font-size:11px; margin-top:2px; font-family:Consolas,monospace; }
   .badges { display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; }
   .badge { font-size:11px; padding:3px 9px; border-radius:99px; white-space:nowrap; }
-  .b-ok   { background:#173a26; color:var(--ok); }
-  .b-warn { background:#3a2d13; color:var(--warn); }
-  .b-bad  { background:#3a1717; color:var(--bad); }
-  .b-dim  { background:#22262f; color:var(--dim); }
+  .b-ok   { background:var(--ok-bg); color:var(--ok); }
+  .b-warn { background:var(--warn-bg); color:var(--warn); }
+  .b-bad  { background:var(--bad-bg); color:var(--bad); }
+  .b-dim  { background:var(--chip); color:var(--dim); }
   .credits { margin:16px 0 14px; display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
   .remain { font-size:34px; font-weight:700; font-variant-numeric:tabular-nums; }
   .remain span { font-size:14px; color:var(--dim); font-weight:400; margin-left:4px; }
@@ -53,7 +64,7 @@
   .meta b { color:var(--fg); font-weight:600; }
   .errline { margin-top:10px; color:var(--bad); font-size:12px; word-break:break-all; }
   /* 权益包明细（含过期时间） */
-  .packs { margin-top:10px; border-top:1px solid #232836; padding-top:10px; display:flex; flex-direction:column; gap:6px; }
+  .packs { margin-top:10px; border-top:1px solid var(--border2); padding-top:10px; display:flex; flex-direction:column; gap:6px; }
   .pack { display:flex; gap:10px; align-items:baseline; font-size:12px; color:var(--dim); }
   .pack .pdesc { flex:1; color:var(--fg); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .pack .pnum { font-variant-numeric:tabular-nums; }
@@ -62,7 +73,7 @@
   .pack.soon .pexp { color:var(--warn); }
   /* accounts table */
   table.accts { width:100%; border-collapse:collapse; font-size:13px; }
-  table.accts th, table.accts td { text-align:left; padding:10px 12px; border-bottom:1px solid #232836; }
+  table.accts th, table.accts td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--border2); }
   table.accts th { color:var(--dim); font-weight:500; font-size:12px; }
   table.accts tr:hover td { background:var(--card2); }
   table.accts .mono { font-family:Consolas,monospace; font-size:11px; color:var(--dim); }
@@ -80,46 +91,57 @@
   .row-actions { display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; }
   .toggle { position:relative; display:inline-block; width:38px; height:20px; }
   .toggle input { opacity:0; width:0; height:0; }
-  .toggle .slider { position:absolute; cursor:pointer; inset:0; background:#2a2f3a; border-radius:99px; transition:.15s; }
+  .toggle .slider { position:absolute; cursor:pointer; inset:0; background:var(--border); border-radius:99px; transition:.15s; }
   .toggle .slider:before { content:""; position:absolute; height:14px; width:14px; left:3px; top:3px; background:var(--dim); border-radius:50%; transition:.15s; }
-  .toggle input:checked + .slider { background:#1c3a5a; }
+  .toggle input:checked + .slider { background:var(--accent-soft); }
   .toggle input:checked + .slider:before { transform:translateX(18px); background:var(--accent); }
   /* login + import */
-  .login-bar { background:var(--card); border:1px solid #232836; border-radius:12px; padding:16px 18px; margin-bottom:18px; }
+  .login-bar { background:var(--card); border:1px solid var(--border2); border-radius:12px; padding:16px 18px; margin-bottom:18px; }
   .login-bar h2 { font-size:14px; font-weight:600; margin-bottom:10px; }
   .login-status { font-size:12px; color:var(--dim); margin-top:8px; word-break:break-all; }
   .login-status.err { color:var(--bad); }
   .login-status.ok { color:var(--ok); }
-  textarea.imp { width:100%; min-height:90px; background:var(--card); border:1px solid #2a2f3a;
+  textarea.imp { width:100%; min-height:90px; background:var(--card); border:1px solid var(--border);
                  border-radius:8px; color:var(--fg); padding:10px 12px; font-size:12px;
                  font-family:Consolas,monospace; resize:vertical; }
   .imp-row { display:flex; gap:10px; align-items:flex-start; margin-top:8px; flex-wrap:wrap; }
   /* modal */
-  .modal-bg { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; z-index:100; }
+  .modal-bg { position:fixed; inset:0; background:var(--overlay); display:none; align-items:center; justify-content:center; z-index:100; }
   .modal-bg.show { display:flex; }
-  .modal { background:var(--card); border:1px solid #2a2f3a; border-radius:12px; padding:20px; max-width:560px; width:92%; max-height:80vh; overflow:auto; }
+  .modal { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:20px; max-width:560px; width:92%; max-height:80vh; overflow:auto; }
   .modal h3 { font-size:15px; margin-bottom:12px; }
-  .modal pre { background:var(--bg); border:1px solid #232836; border-radius:8px; padding:12px; font-size:12px;
+  .modal pre { background:var(--bg); border:1px solid var(--border2); border-radius:8px; padding:12px; font-size:12px;
               font-family:Consolas,monospace; overflow:auto; white-space:pre-wrap; word-break:break-all; color:var(--fg); }
   .modal .close { margin-top:14px; }
   .spin { display:inline-block; width:12px; height:12px; border:2px solid var(--card2); border-top-color:var(--accent);
           border-radius:50%; animation:sp .8s linear infinite; vertical-align:-2px; }
   @keyframes sp { to { transform:rotate(360deg); } }
   /* 请求流水：汇总卡片 + 24h 柱状图 */
-  .ucard { background:var(--card); border:1px solid #232836; border-radius:12px; padding:16px 18px; margin-bottom:14px; }
+  .ucard { background:var(--card); border:1px solid var(--border2); border-radius:12px; padding:16px 18px; margin-bottom:14px; }
   .ustats { display:grid; grid-template-columns:repeat(auto-fit,minmax(112px,1fr)); gap:12px; }
   .ustat { text-align:center; }
   .ustat-v { font-size:20px; font-weight:700; font-variant-numeric:tabular-nums; }
   .ustat-v.ok { color:var(--ok); } .ustat-v.bad { color:var(--bad); }
   .ustat-v.warn { color:var(--warn); } .ustat-v.dim { color:var(--dim); }
   .ustat-l { font-size:11px; color:var(--dim); margin-top:3px; }
-  .ubars { margin-top:16px; border-top:1px solid #232836; padding-top:12px; }
+  .ubars { margin-top:16px; border-top:1px solid var(--border2); padding-top:12px; }
   .ubars-t { font-size:12px; color:var(--dim); margin-bottom:8px; }
   .ubars-row { display:flex; align-items:flex-end; gap:2px; height:64px; }
   .ubar-col { flex:1; display:flex; flex-direction:column; justify-content:flex-end; height:100%; }
   .ubar { background:var(--accent); border-radius:2px 2px 0 0; min-height:1px; }
   .ubar-h { font-size:9px; color:var(--dim); text-align:center; margin-top:3px; font-variant-numeric:tabular-nums; }
 </style>
+<script>
+/* 主题预置：必须在渲染前定好 data-theme，避免首屏闪黑 */
+(function(){
+  try {
+    var pref = localStorage.getItem('tw2a-theme') || 'auto';
+    var sysLight = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches;
+    document.documentElement.setAttribute('data-theme',
+      pref === 'auto' ? (sysLight ? 'light' : 'dark') : pref);
+  } catch(e) {}
+})();
+</script>
 </head>
 <body>
 <div class="wrap">
@@ -127,6 +149,7 @@
     <h1>trae2api 控制台<small>凭证管理 · 额度监控</small></h1>
     <div class="toolbar">
       <span id="ts"></span>
+      <button class="btn" id="themeBtn" onclick="cycleTheme()" title="主题：跟随系统 / 亮色 / 深色">🖥 跟随系统</button>
       <button class="btn" onclick="refreshActive()">刷新</button>
     </div>
   </header>
@@ -199,18 +222,18 @@
     </div>
     <div class="orderbar">
       <span>日期</span>
-      <input type="date" id="usageDate" onchange="loadUsage()" style="background:var(--card);border:1px solid #2a2f3a;border-radius:6px;color:var(--fg);padding:4px 8px;font-size:12px">
+      <input type="date" id="usageDate" onchange="loadUsage()" style="background:var(--card);border:1px solid var(--border);border-radius:6px;color:var(--fg);padding:4px 8px;font-size:12px">
       <button class="btn sm" onclick="shiftUsageDate(-1)">前一天</button>
       <button class="btn sm" onclick="shiftUsageDate(1)">后一天</button>
       <button class="btn sm" onclick="setUsageDate(todayStr())">今天</button>
       <span style="margin-left:8px">流量</span>
-      <select id="usageProbe" onchange="loadUsage()" style="background:var(--card);border:1px solid #2a2f3a;border-radius:6px;color:var(--fg);padding:4px 8px;font-size:12px">
+      <select id="usageProbe" onchange="loadUsage()" style="background:var(--card);border:1px solid var(--border);border-radius:6px;color:var(--fg);padding:4px 8px;font-size:12px">
         <option value="all">全部</option>
         <option value="real">仅真实</option>
         <option value="probe">仅探测</option>
       </select>
       <span style="margin-left:8px">条数</span>
-      <select id="usageLimit" onchange="loadUsage()" style="background:var(--card);border:1px solid #2a2f3a;border-radius:6px;color:var(--fg);padding:4px 8px;font-size:12px">
+      <select id="usageLimit" onchange="loadUsage()" style="background:var(--card);border:1px solid var(--border);border-radius:6px;color:var(--fg);padding:4px 8px;font-size:12px">
         <option value="50">50</option>
         <option value="200" selected>200</option>
         <option value="500">500</option>
@@ -235,6 +258,30 @@
 <script>
 let activeTab = 'accounts';
 let loginPollTimer = null;
+
+/* ─── 主题：跟随系统 / 亮色 / 深色（localStorage 记忆）─── */
+const THEME_ORDER = ['auto','light','dark'];
+function themePref(){ try { return localStorage.getItem('tw2a-theme') || 'auto'; } catch(e){ return 'auto'; } }
+function applyTheme(pref){
+  const sysLight = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches;
+  const resolved = pref === 'auto' ? (sysLight ? 'light' : 'dark') : pref;
+  document.documentElement.setAttribute('data-theme', resolved);
+  const btn = document.getElementById('themeBtn');
+  if (btn) btn.textContent = pref === 'auto' ? '🖥 跟随系统' : (pref === 'light' ? '☀️ 亮色' : '🌙 深色');
+}
+function cycleTheme(){
+  const next = THEME_ORDER[(THEME_ORDER.indexOf(themePref()) + 1) % THEME_ORDER.length];
+  try { localStorage.setItem('tw2a-theme', next); } catch(e){}
+  applyTheme(next);
+}
+applyTheme(themePref());
+/* auto 模式下实时跟随系统切换 */
+if (window.matchMedia) {
+  const mq = window.matchMedia('(prefers-color-scheme: light)');
+  const onChange = function(){ if (themePref() === 'auto') applyTheme('auto'); };
+  if (mq.addEventListener) mq.addEventListener('change', onChange);
+  else if (mq.addListener) mq.addListener(onChange);
+}
 
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function badge(text, cls){ return '<span class="badge '+cls+'">'+esc(text)+'</span>'; }
