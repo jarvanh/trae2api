@@ -63,7 +63,7 @@ func main() {
 		Upstream:     up,
 		CheckinHour:  cfg.Schedule.CheckinHour,
 		RefreshHours: cfg.Schedule.RefreshHours,
-		RefreshSkew:  24 * time.Hour,
+		RefreshSkew:  cfg.RefreshSkewDur,
 		// 流水归档钩子：UsageRetentionDays<=0 时 ArchiveUsage 内部直接返回 0,0（不启用）
 		ArchiveUsage: func() (int, int, error) {
 			return server.ArchiveUsage(cfg.UsageDir, cfg.UsageRetentionDays)
@@ -86,6 +86,9 @@ func main() {
 		WorkBridgeURL:   cfg.WorkBridgeURL,
 		WorkBridgeToken: cfg.WorkBridgeToken,
 		Keepalive:       time.Duration(cfg.Upstream.KeepaliveSeconds) * time.Second,
+		// token 预刷新窗口与调度器同源：两条刷新路径（定时 / 请求）用同一个 skew，
+		// 避免「控制台看着没过期但请求才刷」这类口径不一致。
+		RefreshSkew: cfg.RefreshSkewDur,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

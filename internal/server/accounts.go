@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"trae2api/internal/auth"
 )
@@ -54,7 +55,13 @@ func (h *Handler) adminAccounts(w http.ResponseWriter, r *http.Request) {
 		if a := h.cfg.Pool.AuthByUID(s.UID); a != nil {
 			sum.HasAuth = true
 			sum.ExpiresAt = a.ExpiresAt
-			if a.ExpiresAt > 0 && a.NeedsRefresh(24*60*60) { // 24h 内过期
+			// 临近过期判定用与刷新同源的 skew（h.cfg.RefreshSkew 为 0 时回落 24h）：
+			// 即「已进入预刷新窗口」就打标，而不是等真的 24h 内才标。
+			skew := h.cfg.RefreshSkew
+			if skew <= 0 {
+				skew = 24 * time.Hour
+			}
+			if a.ExpiresAt > 0 && a.NeedsRefresh(skew) {
 				sum.ExpiredSoon = true
 			}
 			sum.MachineID = prefix(a.MachineID, 8)

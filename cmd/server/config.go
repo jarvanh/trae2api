@@ -35,6 +35,10 @@ type Config struct {
 	Schedule struct {
 		CheckinHour  int   `json:"checkin_hour"`  // 9
 		RefreshHours []int `json:"refresh_hours"` // [3]
+		// RefreshSkew token 预刷新窗口（如 "72h"）：到期前多久就开始续期。
+		// 留空/非法 → 默认 72h。上游每次续期给 14 天，窗口太窄（如 24h）
+		// 会让刷新只押在到期当天那一轮定时任务上，上游抽风就真过期了。
+		RefreshSkew string `json:"refresh_skew"` // "72h"
 	} `json:"schedule"`
 
 	// UsageRetentionDays 日粒度流水保留天数：超期归档成月汇总后删除明细。
@@ -53,6 +57,8 @@ type Config struct {
 	PlanCreditDur  time.Duration `json:"-"`
 	SoftRateDur    time.Duration `json:"-"`
 	ErrCooldownDur time.Duration `json:"-"`
+	// RefreshSkewDur 由 schedule.refresh_skew 解析而来（token 预刷新窗口）。
+	RefreshSkewDur time.Duration `json:"-"`
 }
 
 // Default 返回默认配置。
@@ -75,6 +81,7 @@ func Default() *Config {
 	c.Cooldown.ErrCooldown = "10m"
 	c.Schedule.CheckinHour = 9
 	c.Schedule.RefreshHours = []int{3}
+	c.Schedule.RefreshSkew = "72h"
 	c.Upstream.TimeoutSeconds = 120
 	c.UsageRetentionDays = 0 // 默认不启用归档（维持现状）
 	return c
@@ -156,6 +163,9 @@ func applyEnv(c *Config) {
 			c.Schedule.CheckinHour = n
 		}
 	}
+	if v := os.Getenv("TW2A_REFRESH_SKEW"); v != "" {
+		c.Schedule.RefreshSkew = v
+	}
 	if v := os.Getenv("TW2A_USAGE_RETENTION_DAYS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			c.UsageRetentionDays = n
@@ -178,6 +188,15 @@ func (c *Config) normalize() error {
 	}
 	if c.ErrCooldownDur, err = time.ParseDuration(c.Cooldown.ErrCooldown); err != nil {
 		return fmt.Errorf("cooldown.err_cooldown: %w", err)
+	}
+	// refresh_skew：合法值直接用；留空/非法/非正数一律回落默认 72h（不因配置笔误启不来）。
+	if s := strings.TrimSpace(c.Schedule.RefreshSkew); s != "" {
+		if d, derr := time.ParseDuration(s); derr == nil && d > 0 {
+			c.RefreshSkewDur = d
+		}
+	}
+	if c.RefreshSkewDur <= 0 {
+		c.RefreshSkewDur = 72 * time.Hour
 	}
 	if c.Cooldown.ErrThresh <= 0 {
 		c.Cooldown.ErrThresh = 3
