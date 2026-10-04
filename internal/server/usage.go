@@ -46,6 +46,10 @@ var usageMu sync.Mutex
 // maxUsageLimit 单次查询返回的最大明细条数（防爆内存/传输）。
 const maxUsageLimit = 1000
 
+// maxRangeDays 区间扫描的天数上限（防误传超大区间把磁盘/内存扫爆）。
+// 略大于面板最大档 30 天，留出余量；超过则截断到 from 侧并给出告警。
+const maxRangeDays = 92
+
 // usageRecord 一次请求的落盘输入（recordUsage 的参数集合）。
 // 成功路径由 handler 在拿到 token 后填满；失败路径在 defer 里补记，token 为 0。
 type usageRecord struct {
@@ -161,32 +165,133 @@ func usageFilePath(dir, date string) string {
 // 文件不存在返回空结果而非错误 —— 当天还没流量属正常状态。
 func usageScan(dir, date string, limit int) ([]usageEntry, usageAggregate, []string) {
 	var agg usageAggregate
-	var warn []string
 	if dir == "" {
-		warn = append(warn, "UsageDir 未配置，无法读取用量流水")
-		return nil, agg, warn
+		return nil, agg, []string{"UsageDir 未配置，无法读取用量流水"}
 	}
-	if limit <= 0 {
-		limit = 200
+	ring := newUsageRing(limit)
+	_, warn := usageScanFile(dir, date, ring, &agg)
+	agg.finish()
+	return ring.entries(), agg, warn
+}
+
+// ─── 区间扫描（7 天 / 30 天）────────────────────────────────────────────────
+//
+// 单日 scan 只够看当天；面板要「近 7 天 / 近 30 天」趋势，就得跨文件汇总。
+// 实现上复用同一套「环形缓冲 + 聚合累加」：按日期升序逐文件扫描，
+// 聚合全程累计，明细始终只留最新 limit 条 —— 30 天十万级记录也不会撑爆内存。
+
+// usageDayStat 区间内某天的摘要（供面板画按天柱状图）。
+type usageDayStat struct {
+	Date     string `json:"date"`
+	Requests int    `json:"requests"`
+	Probe    int    `json:"probe"`
+	Real     int    `json:"real"`
+	Errors   int    `json:"errors"`
+	In       int64  `json:"in"`
+	Out      int64  `json:"out"`
+}
+
+// usageRangeResult 区间扫描结果。
+type usageRangeResult struct {
+	Entries []usageEntry   // 区间内最新的 limit 条（新→旧）
+	Agg     usageAggregate // 区间全量聚合（明细条数不影响）
+	Daily   []usageDayStat // 按天摘要（升序，含无流量的天 → 全 0）
+	Warn    []string
+	Days    []string // 实际读到流水文件的日期（升序）
+	Missing []string // 区间内无流水文件的日期（升序，可能是没流量或已归档删明细）
+}
+
+// usageScanRange 扫描 [from, to] 闭区间（北京日期 YYYY-MM-DD）内所有日粒度流水。
+// from > to 时自动交换；天数超过 maxRangeDays 从 from 侧截断并告警。
+func usageScanRange(dir, from, to string, limit int) usageRangeResult {
+	var res usageRangeResult
+	if dir == "" {
+		res.Warn = []string{"UsageDir 未配置，无法读取用量流水"}
+		return res
 	}
-	if limit > maxUsageLimit {
-		limit = maxUsageLimit
+	dates, err := usageDateRange(from, to)
+	if err != nil {
+		res.Warn = []string{"区间日期非法：" + err.Error()}
+		return res
 	}
+	if len(dates) > maxRangeDays {
+		res.Warn = append(res.Warn, fmt.Sprintf("区间 %d 天超过上限 %d 天，已截断为最近的 %d 天",
+			len(dates), maxRangeDays, maxRangeDays))
+		dates = dates[len(dates)-maxRangeDays:]
+	}
+	ring := newUsageRing(limit)
+	var agg usageAggregate
+	res.Daily = make([]usageDayStat, 0, len(dates))
+	for _, d := range dates {
+		var day usageAggregate // 当天小计（一次扫描同时喂给总量与当天）
+		ok, w := usageScanFile(dir, d, ring, &agg, &day)
+		res.Warn = append(res.Warn, w...)
+		if ok {
+			res.Days = append(res.Days, d)
+		} else {
+			res.Missing = append(res.Missing, d)
+		}
+		res.Daily = append(res.Daily, usageDayStat{
+			Date: d, Requests: day.Requests, Probe: day.Probe, Real: day.Real,
+			Errors: day.Errors, In: day.In, Out: day.Out,
+		})
+	}
+	agg.finish()
+	res.Agg = agg
+	res.Entries = ring.entries()
+	return res
+}
+
+// usageDateRange 生成 [from,to] 闭区间的北京日期列表（升序）。
+// from > to 时交换；解析失败返回错误（日期来自 URL，必须先校验再拼文件名）。
+func usageDateRange(from, to string) ([]string, error) {
+	f, err := time.Parse("2006-01-02", from)
+	if err != nil {
+		return nil, fmt.Errorf("from %q 非法", from)
+	}
+	t, err := time.Parse("2006-01-02", to)
+	if err != nil {
+		return nil, fmt.Errorf("to %q 非法", to)
+	}
+	if f.After(t) {
+		f, t = t, f
+	}
+	var out []string
+	// UTC 零点按天递增，无 DST 干扰；日期只用作字符串与文件名
+	for d := f; !d.After(t); d = d.AddDate(0, 0, 1) {
+		out = append(out, d.Format("2006-01-02"))
+	}
+	return out, nil
+}
+
+// usageShiftDate 把 YYYY-MM-DD 平移 delta 天（面板算区间起点用）。
+func usageShiftDate(date string, delta int) (string, error) {
+	d, err := time.Parse("2006-01-02", date)
+	if err != nil {
+		return "", err
+	}
+	return d.AddDate(0, 0, delta).Format("2006-01-02"), nil
+}
+
+// usageScanFile 扫描单日流水文件：解析每行 → 累加进所有 aggs → 明细进 ring。
+//
+// aggs 是可变的：区间统计同时要「区间总量」和「当天小计」，传两个即可一次扫完，
+// 不必为按天柱状图再读一遍文件。
+// 文件不存在返回 (false, nil)：当天无流量是正常状态，不算错误。
+func usageScanFile(dir, date string, ring *usageRing, aggs ...*usageAggregate) (bool, []string) {
+	var warn []string
 	path := usageFilePath(dir, date)
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, agg, nil // 当天无流量：正常
+			return false, nil
 		}
-		warn = append(warn, "读取 "+filepath.Base(path)+" 失败："+err.Error())
-		return nil, agg, warn
+		return false, []string{"读取 " + filepath.Base(path) + " 失败：" + err.Error()}
 	}
 	defer f.Close()
 
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64<<10), 1<<20) // 单行上限 1MB
-	ring := make([]usageEntry, 0, limit)      // 环形：满了就丢最旧
-	n := 0
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" {
@@ -196,33 +301,64 @@ func usageScan(dir, date string, limit int) ([]usageEntry, usageAggregate, []str
 		if err := json.Unmarshal([]byte(line), &e); err != nil {
 			continue // 坏行跳过，不影响面板
 		}
-		agg.add(e)
-		if len(ring) < limit {
-			ring = append(ring, e)
-		} else {
-			ring[n%limit] = e // 覆盖最旧的一条
+		for _, a := range aggs {
+			if a != nil {
+				a.add(e)
+			}
 		}
-		n++
+		ring.add(e)
 	}
 	if err := sc.Err(); err != nil {
-		warn = append(warn, "扫描中断："+err.Error())
+		warn = append(warn, "扫描 "+filepath.Base(path)+" 中断："+err.Error())
 	}
+	return true, warn
+}
 
-	// ring 内的实际时序：n<=limit 时是自然顺序；超过后是环形，从 n%limit 起才是最新
-	out := make([]usageEntry, 0, len(ring))
-	if n > limit {
-		start := n % limit
-		out = append(out, ring[start:]...)
-		out = append(out, ring[:start]...)
+// usageRing 保留最新 limit 条明细的环形缓冲（单日与跨日区间共用）。
+//
+// 必须按**时间升序** add：日期升序 + 文件内追加顺序天然满足。
+// 满了就覆盖最旧一条，避免为取最新 N 条而在内存里存下全部记录。
+type usageRing struct {
+	buf   []usageEntry
+	limit int
+	n     int // 累计 add 次数
+}
+
+func newUsageRing(limit int) *usageRing {
+	if limit <= 0 {
+		limit = 200
+	}
+	if limit > maxUsageLimit {
+		limit = maxUsageLimit
+	}
+	return &usageRing{buf: make([]usageEntry, 0, limit), limit: limit}
+}
+
+func (r *usageRing) add(e usageEntry) {
+	if len(r.buf) < r.limit {
+		r.buf = append(r.buf, e)
 	} else {
-		out = append(out, ring...)
+		r.buf[r.n%r.limit] = e // 覆盖最旧的一条
+	}
+	r.n++
+}
+
+// entries 返回新→旧顺序的明细。
+// 未填满时 buf 即自然升序；填满后从 n%limit 起才是最新的那条。
+func (r *usageRing) entries() []usageEntry {
+	out := make([]usageEntry, 0, len(r.buf))
+	if r.n > r.limit {
+		start := r.n % r.limit
+		out = append(out, r.buf[start:]...)
+		out = append(out, r.buf[:start]...)
+	} else {
+		out = append(out, r.buf...)
 	}
 	// 面板要新→旧
 	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
 		out[i], out[j] = out[j], out[i]
 	}
-	agg.finish()
-	return out, agg, warn
+	return out
 }
 
 // usageAggregate 某天 usage jsonl 的全量聚合（用于流水页头部卡片）。

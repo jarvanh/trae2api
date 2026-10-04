@@ -411,3 +411,178 @@ func TestArchiveInvalidDir(t *testing.T) {
 		t.Errorf("空目录应无操作，got %d/%d/%v", a, r, err)
 	}
 }
+
+// ─── 区间扫描（7 天 / 30 天）────────────────────────────────────────────────
+
+// writeUsageDays 在同一目录下写多天流水文件（区间扫描要求多文件共存）。
+func writeUsageDays(t *testing.T, days map[string][]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	for date, lines := range days {
+		path := usageFilePath(dir, date)
+		if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+			t.Fatalf("写入 %s 失败：%v", date, err)
+		}
+	}
+	return dir
+}
+
+// TestUsageScanRangeAggregate 区间聚合 = 各天之和（这是 7 天/30 天卡片的数据源）。
+func TestUsageScanRangeAggregate(t *testing.T) {
+	dir := writeUsageDays(t, map[string][]string{
+		"2026-09-28": {entry(1000, "m1", false, 10, 20), entry(1100, "m1", true, 1, 1)},
+		"2026-09-29": {entry(2000, "m2", false, 30, 40)},
+		"2026-09-30": {entry(3000, "m1", false, 5, 5), entry(3100, "m3", false, 5, 5)},
+	})
+	res := usageScanRange(dir, "2026-09-28", "2026-09-30", 100)
+	if len(res.Warn) != 0 {
+		t.Fatalf("不应有告警：%v", res.Warn)
+	}
+	if res.Agg.Requests != 5 {
+		t.Errorf("区间请求数 = %d, 期望 5", res.Agg.Requests)
+	}
+	if res.Agg.Probe != 1 || res.Agg.Real != 4 {
+		t.Errorf("探测/真实 = %d/%d, 期望 1/4", res.Agg.Probe, res.Agg.Real)
+	}
+	// 10+1+30+5+5 = 51
+	if res.Agg.In != 51 {
+		t.Errorf("区间输入 token = %d, 期望 51", res.Agg.In)
+	}
+	if len(res.Days) != 3 {
+		t.Errorf("有流水的天数 = %d, 期望 3", len(res.Days))
+	}
+}
+
+// TestUsageScanRangeDaily 按天摘要必须与区间同步产出，且无流量的天补 0（否则柱状图错位）。
+func TestUsageScanRangeDaily(t *testing.T) {
+	dir := writeUsageDays(t, map[string][]string{
+		"2026-09-28": {entry(1000, "m1", false, 1, 1), entry(1050, "m1", false, 1, 1)},
+		// 09-29 故意不写文件：模拟当天无流量
+		"2026-09-30": {entry(3000, "m1", false, 1, 1)},
+	})
+	res := usageScanRange(dir, "2026-09-28", "2026-09-30", 100)
+	if len(res.Daily) != 3 {
+		t.Fatalf("daily 长度 = %d, 期望 3（无流量的天也要占位）", len(res.Daily))
+	}
+	want := map[string]int{"2026-09-28": 2, "2026-09-29": 0, "2026-09-30": 1}
+	for _, d := range res.Daily {
+		if d.Requests != want[d.Date] {
+			t.Errorf("%s 请求数 = %d, 期望 %d", d.Date, d.Requests, want[d.Date])
+		}
+	}
+	// 顺序必须升序 —— 面板柱状图按数组下标画，乱序会让趋势看着像随机跳动
+	if res.Daily[0].Date != "2026-09-28" || res.Daily[2].Date != "2026-09-30" {
+		t.Errorf("daily 必须按日期升序，got %v", []string{res.Daily[0].Date, res.Daily[1].Date, res.Daily[2].Date})
+	}
+	if len(res.Missing) != 1 || res.Missing[0] != "2026-09-29" {
+		t.Errorf("缺失日期 = %v, 期望 [2026-09-29]", res.Missing)
+	}
+}
+
+// TestUsageScanRangeNewestFirst 跨天区间：明细仍须新→旧，
+// 且 limit 只保留全区间**最新**的若干条 —— 环形缓冲跨文件后起点最易写错。
+func TestUsageScanRangeNewestFirst(t *testing.T) {
+	dir := writeUsageDays(t, map[string][]string{
+		"2026-09-28": {entry(1000, "m", false, 1, 1), entry(2000, "m", false, 1, 1)},
+		"2026-09-29": {entry(3000, "m", false, 1, 1), entry(4000, "m", false, 1, 1)},
+		"2026-09-30": {entry(5000, "m", false, 1, 1), entry(6000, "m", false, 1, 1)},
+	})
+	res := usageScanRange(dir, "2026-09-28", "2026-09-30", 3)
+	want := []int64{6000, 5000, 4000}
+	if len(res.Entries) != len(want) {
+		t.Fatalf("明细条数 = %d, 期望 %d", len(res.Entries), len(want))
+	}
+	for i, ts := range want {
+		if res.Entries[i].T != ts {
+			t.Errorf("第 %d 条 T = %d, 期望 %d", i, res.Entries[i].T, ts)
+		}
+	}
+	// 聚合不受 limit 影响，仍是全量 6 条
+	if res.Agg.Requests != 6 {
+		t.Errorf("聚合请求数 = %d, 期望 6（明细 limit 不应影响聚合）", res.Agg.Requests)
+	}
+}
+
+// TestUsageScanRangeSwapDates from > to 时自动交换，不返回空结果。
+func TestUsageScanRangeSwapDates(t *testing.T) {
+	dir := writeUsageDays(t, map[string][]string{
+		"2026-09-28": {entry(1000, "m", false, 1, 1)},
+		"2026-09-30": {entry(3000, "m", false, 1, 1)},
+	})
+	res := usageScanRange(dir, "2026-09-30", "2026-09-28", 100)
+	if res.Agg.Requests != 2 {
+		t.Errorf("请求数 = %d, 期望 2（from>to 应自动交换）", res.Agg.Requests)
+	}
+	if len(res.Daily) != 3 {
+		t.Errorf("daily 长度 = %d, 期望 3", len(res.Daily))
+	}
+}
+
+// TestUsageScanRangeTruncate 超长区间必须被截断并告警 —— 防误传超大值把磁盘扫爆。
+func TestUsageScanRangeTruncate(t *testing.T) {
+	dir := t.TempDir()
+	res := usageScanRange(dir, "2020-01-01", "2026-09-30", 10)
+	if len(res.Daily) > maxRangeDays {
+		t.Errorf("扫描天数 = %d, 应被截断到 %d 以内", len(res.Daily), maxRangeDays)
+	}
+	if len(res.Warn) == 0 {
+		t.Error("截断时应给出告警，否则用户不知道自己看到的是不完整区间")
+	}
+}
+
+// TestUsageScanRangeInvalid 非法日期 / 空 dir 都要安全返回，不 panic。
+func TestUsageScanRangeInvalid(t *testing.T) {
+	if res := usageScanRange("", "2026-09-28", "2026-09-30", 10); len(res.Warn) == 0 {
+		t.Error("空 dir 应给出告警")
+	}
+	res := usageScanRange(t.TempDir(), "not-a-date", "2026-09-30", 10)
+	if len(res.Warn) == 0 {
+		t.Error("非法日期应给出告警")
+	}
+	if len(res.Daily) != 0 || res.Agg.Requests != 0 {
+		t.Error("非法输入应返回空结果")
+	}
+}
+
+// TestUsageDateRange 日期列表生成：闭区间、升序、含首尾。
+func TestUsageDateRange(t *testing.T) {
+	got, err := usageDateRange("2026-09-28", "2026-09-30")
+	if err != nil {
+		t.Fatalf("不应报错：%v", err)
+	}
+	want := []string{"2026-09-28", "2026-09-29", "2026-09-30"}
+	if len(got) != len(want) {
+		t.Fatalf("长度 = %d, 期望 %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("第 %d 个 = %s, 期望 %s", i, got[i], want[i])
+		}
+	}
+	// 单日区间 = 只有自己
+	one, _ := usageDateRange("2026-09-30", "2026-09-30")
+	if len(one) != 1 || one[0] != "2026-09-30" {
+		t.Errorf("单日区间 = %v, 期望 [2026-09-30]", one)
+	}
+	// 跨月边界（9/30 → 10/02）：进位不能出错
+	cross, _ := usageDateRange("2026-09-30", "2026-10-02")
+	if len(cross) != 3 || cross[1] != "2026-10-01" || cross[2] != "2026-10-02" {
+		t.Errorf("跨月区间 = %v, 期望 [09-30 10-01 10-02]", cross)
+	}
+}
+
+// TestUsageShiftDate 面板算区间起点用：负偏移取回溯日，跨月跨年都要对。
+func TestUsageShiftDate(t *testing.T) {
+	if got, _ := usageShiftDate("2026-09-30", -6); got != "2026-09-24" {
+		t.Errorf("-6 天 = %s, 期望 2026-09-24（7 天区间起点）", got)
+	}
+	if got, _ := usageShiftDate("2026-09-30", -29); got != "2026-09-01" {
+		t.Errorf("-29 天 = %s, 期望 2026-09-01（30 天区间起点）", got)
+	}
+	if got, _ := usageShiftDate("2026-01-05", -10); got != "2025-12-26" {
+		t.Errorf("跨年 -10 天 = %s, 期望 2025-12-26", got)
+	}
+	if _, err := usageShiftDate("bad", -1); err == nil {
+		t.Error("非法日期应返回错误")
+	}
+}

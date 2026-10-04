@@ -331,9 +331,13 @@ func (h *Handler) adminGetOrder(w http.ResponseWriter, r *http.Request) {
 // adminUsage 请求流水：读取某天（默认北京今天）的 usage jsonl，
 // 返回明细（新→旧）+ 全量聚合（请求数/成功失败/token/按模型/按小时）。
 //
+// 除单日外还支持区间（7 天 / 30 天）：跨多个 usage-*.jsonl 汇总，
+// 聚合全程累计、明细只留最新 limit 条，并额外给出按天摘要供面板画趋势柱。
+//
 // 只读接口，无鉴权（与 credits/models 一致，局域网内面板）。
 // 参数：
-//   - date  ：北京日期 YYYY-MM-DD，默认今天
+//   - date  ：北京日期 YYYY-MM-DD，默认今天；区间模式下作为**结束日**
+//   - range ：1d(默认) | 7d | 30d，统计区间跨度
 //   - limit ：明细条数上限，默认 200（最大 1000）
 //   - probe ：all(默认) | real | probe，过滤探测/真实流量
 func (h *Handler) adminUsage(w http.ResponseWriter, r *http.Request) {
@@ -347,6 +351,15 @@ func (h *Handler) adminUsage(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "date 需为 YYYY-MM-DD"})
 		return
 	}
+	// 区间跨度：1d = 只看 date 当天（向后兼容旧前端）；7d / 30d = 以 date 为结束日回溯。
+	// 非法值一律退回 1d —— 面板档位是固定的，异常值不值得报错打断。
+	spanDays := 1
+	switch strings.ToLower(strings.TrimSpace(q.Get("range"))) {
+	case "7d", "7":
+		spanDays = 7
+	case "30d", "30":
+		spanDays = 30
+	}
 	limit := 200
 	if v := strings.TrimSpace(q.Get("limit")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -354,7 +367,23 @@ func (h *Handler) adminUsage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	entries, agg, warn := usageScan(h.cfg.UsageDir, date, limit)
+	var entries []usageEntry
+	var agg usageAggregate
+	var warn []string
+	var daily []usageDayStat
+	from := date
+	if spanDays <= 1 {
+		entries, agg, warn = usageScan(h.cfg.UsageDir, date, limit)
+	} else {
+		f, err := usageShiftDate(date, -(spanDays - 1))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "date 需为 YYYY-MM-DD"})
+			return
+		}
+		from = f
+		res := usageScanRange(h.cfg.UsageDir, from, date, limit)
+		entries, agg, warn, daily = res.Entries, res.Agg, res.Warn, res.Daily
+	}
 
 	// 探测/真实过滤（过滤只影响明细，聚合仍是全量 —— 全量口径更有参考价值）
 	probeFilter := strings.ToLower(strings.TrimSpace(q.Get("probe")))
@@ -392,14 +421,30 @@ func (h *Handler) adminUsage(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"date":       date,
+		"range":      rangeLabel(spanDays),
+		"from":       from,
+		"to":         date,
 		"fetched_at": time.Now().In(beijing).Format("2006-01-02 15:04:05"),
 		"entries":    entries,
 		"agg":        agg,
+		"daily":      daily,
 		"warn":       warn,
 		"usage_dir":  h.cfg.UsageDir,
 		"nicknames":  nicknames,
 		"rates":      rates,
 	})
+}
+
+// rangeLabel 把区间天数转成面板约定的字符串（1d/7d/30d）。
+func rangeLabel(days int) string {
+	switch {
+	case days >= 30:
+		return "30d"
+	case days >= 7:
+		return "7d"
+	default:
+		return "1d"
+	}
 }
 
 // adminSaveOrder 保存控制台拖动排序结果（写操作，需 Bearer 鉴权）。
