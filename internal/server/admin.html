@@ -62,6 +62,10 @@
   .remain span { font-size:14px; color:var(--dim); font-weight:400; margin-left:4px; }
   .meta { color:var(--dim); font-size:12px; display:flex; gap:14px; flex-wrap:wrap; }
   .meta b { color:var(--fg); font-weight:600; }
+  /* 「已领」用绿色弱化呈现：与「今日可领」形成已办/待办的视觉区分，
+     避免已签到的号看起来还像没签（数值本身是常量，看不出状态）。 */
+  .meta .ck-done { color:var(--ok); }
+  .meta .ck-done b { color:var(--ok); }
   .errline { margin-top:10px; color:var(--bad); font-size:12px; word-break:break-all; }
   /* 权益包明细（含过期时间） */
   .packs { margin-top:10px; border-top:1px solid var(--border2); padding-top:10px; display:flex; flex-direction:column; gap:6px; }
@@ -956,9 +960,17 @@ function renderCredits(d){
     }
     const remainLine = a.error ? '<div style="color:var(--bad);font-size:14px">额度查询失败</div>'
       : '<div class="remain">'+fmt(a.remain)+'<span>积分剩余</span></div>';
+    // 签到额度文案必须区分「已领 / 可领」：
+    // checkin_credits 是上游给的日奖励额度（常量），只看它无法判断今天签没签，
+    // 必须结合 checked_in —— 否则已签到的号也会一直显示「今日可领」，误导运维。
+    const checkinMeta = a.checkin_enable
+      ? (a.checked_in
+          ? '<span class="ck-done">已领 <b>'+fmt(a.checkin_credits)+'</b></span>'
+          : '<span>今日可领 <b>'+fmt(a.checkin_credits)+'</b></span>')
+      : '';
     const meta = a.error ? '' :
       '<div class="meta"><span>总量 <b>'+fmt(a.limit)+'</b></span><span>已用 <b>'+fmt(a.used)+'</b></span>'+
-      (a.checkin_enable ? '<span>今日可领 <b>'+fmt(a.checkin_credits)+'</b></span>' : '')+'</div>';
+      checkinMeta+'</div>';
     return '<div class="card'+(a.error?' err':'')+'"'+dragAttrs(a.uid, 'curCreditIds', 'applyCreditOrder')+'>'
       + '<div class="card-top"><div><div class="nick">'+esc(a.nickname||'(未命名)')+'</div>'
       + '<div class="uid">'+esc(a.uid)+'</div></div><div class="badges">'+badges+'</div></div>'
