@@ -408,7 +408,7 @@ func (p *Pool) PickAffinity(sessionKey string, tried map[string]bool) *auth.Auth
 		}
 	}
 
-	// 2. 无粘性绑定或原账号已不可用/已满载，走三因子加权与防惊群短名单调度
+	// 2. 无粘性绑定或原账号已不可用/已满载，走三因子规则序（非加权）与防惊群短名单调度
 	best := p.pickBestCandidateLocked(tried, now)
 	if best == nil {
 		return nil

@@ -35,12 +35,12 @@ type Config struct {
 	SoftCooldown    time.Duration // 429 冷却，默认 60s
 	ErrThreshold    int           // 连续错误阈值，默认 3
 	ErrCooldown     time.Duration // 错误冷却，默认 10m
-	RefreshSkew     time.Duration // token 预刷新窗口，默认 24h
+	RefreshSkew     time.Duration // token 预刷新窗口，默认 72h（schedule.refresh_skew 可配）
 	DefaultModel    string        // 默认 glm-5.2
 	WorkBridgeURL   string        // 本地 Work 积分桥接端点，如 http://127.0.0.1:7865
 	WorkBridgeToken string        // 访问 WorkBridge 的 Bearer token（空 = 不带鉴权）
 	// Keepalive 流式响应在「首个真实帧到达前」的心跳间隔（SSE 注释帧 `: ping`）。
-	// <=0 = 关闭。用于防止边缘网关因长排队窗口连接静默而提前掐断（502）。
+	// <=0 = 不发心跳（cmd/server 载入配置时未设/0 已归一化为默认 15s，负数才是显式关闭）。用于防止边缘网关因长排队窗口连接静默而提前掐断（502）。
 	Keepalive time.Duration
 }
 
@@ -76,7 +76,7 @@ func NewHandler(cfg Config) *Handler {
 		cfg.ErrCooldown = 10 * time.Minute
 	}
 	if cfg.RefreshSkew <= 0 {
-		cfg.RefreshSkew = 24 * time.Hour
+		cfg.RefreshSkew = 72 * time.Hour
 	}
 	if cfg.DefaultModel == "" {
 		cfg.DefaultModel = upstream.DefaultConfigName

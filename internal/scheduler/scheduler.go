@@ -20,7 +20,7 @@ type Config struct {
 	Upstream     *upstream.Client
 	CheckinHour  int           // 每日签到小时，默认 9
 	RefreshHours []int         // token 预刷新小时，默认 [3]
-	RefreshSkew  time.Duration // 预刷新窗口，默认 24h
+	RefreshSkew  time.Duration // 预刷新窗口，默认 72h
 
 	// ArchiveUsage 流水归档钩子（可选，nil = 不启用）。
 	// 用函数注入而非直接 import server 包：scheduler 只依赖 pool/upstream，
@@ -42,7 +42,7 @@ func New(cfg Config) *Scheduler {
 		cfg.RefreshHours = []int{3}
 	}
 	if cfg.RefreshSkew <= 0 {
-		cfg.RefreshSkew = 24 * time.Hour
+		cfg.RefreshSkew = 72 * time.Hour
 	}
 	return &Scheduler{cfg: cfg}
 }

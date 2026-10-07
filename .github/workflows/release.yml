@@ -28,7 +28,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23' # 与 Dockerfile 的 golang:1.23-alpine 对齐
+          go-version: '1.23' # 满足 go.mod（1.22+）；Dockerfile 已单阶段化（直接下载 Release 二进制，不再编译 Go）
           cache: true
 
       - name: 计算版本号

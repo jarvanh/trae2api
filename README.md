@@ -17,7 +17,7 @@
 
 ---
 
-> **借鉴说明**：本项目基于上游 [`Sliverkiss/traework2api`](https://github.com/Sliverkiss/traework2api) 改进，新增 Work 通道、`work_client.go` 私有协议、Web 管理控制台、加权防惊群调度等能力。
+> **借鉴说明**：本项目基于上游 [`Sliverkiss/traework2api`](https://github.com/Sliverkiss/traework2api) 改进，新增 Work 通道、`work_client.go` 私有协议、Web 管理控制台、严格规则序调度（临期权益优先）与防惊群窗口等能力。
 
 ## 概述
 
@@ -30,8 +30,8 @@
 - **OpenAI 协议兼容**：提供标准 `/v1/chat/completions`（支持流式 Streaming 与非流式）与 `/v1/models` 端点，无缝接入 NextChat、Chatbox、Claude Code、Cline 等客户端。
 - **可视化 Web 管理控制台**：内置轻量 Web 界面（`GET /admin`），实时展示账号配额（剩余/已用/总量）、签到状态与健康度，支持多账号并发查询与自动刷新。
 - **凭证全生命周期管理**：提供 Web 凭证导入、软启停开关、昵称修改、删除及一键 Web 登录闭环（无需手动抓包或提取 Token）。
-- **多账号智能调度池**：基于账号可用积分降序挑选，自动处理 1005、429、401、5xx 等异常状态，支持动态冷却与故障自动轮转。
-- **自动化运维与保活**：每日定时自动签到，并在 Token 过期前 24 小时自动预刷新与原子落盘，保障长周期稳定可用。
+- **多账号智能调度池**：按「最早到期权益包优先 → 剩余积分最少 → UID 升序」的规则序挑选，自动处理 1005、429、401、5xx 等异常状态，支持动态冷却与故障自动轮转。
+- **自动化运维与保活**：每日定时自动签到，并在 Token 过期前 72 小时自动预刷新与原子落盘（窗口可配 schedule.refresh_skew），保障长周期稳定可用。
 - **新模型支持**：同步支持 glm-5.3、glm-5.2 等新版模型调度，适配最新协议版本。
 - **纯净轻量**：纯 Go 标准库开发，零第三方运行时依赖，静态编译产物小巧，内存占用极低。
 
@@ -144,7 +144,7 @@ curl -X POST http://127.0.0.1:7864/v1/chat/completions \
 
 ## 配置项参考
 
-所有配置项均可通过环境变量或 `config.json` 进行调整：
+配置项可通过环境变量或 `config.json` 调整（个别项仅支持其一，见表后注）：
 
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
@@ -155,9 +155,11 @@ curl -X POST http://127.0.0.1:7864/v1/chat/completions \
 | `TW2A_DEFAULT_MODEL` | `glm-5.2` | 默认回退请求模型 |
 | `TW2A_CALLBACK_PORT` | `18080` | 本地 OAuth 回调端口（设为 0 可关闭） |
 | `TW2A_TIMEOUT_SECONDS` | `120` | 上游请求超时时长（秒） |
-| `TW2A_KEEPALIVE_SECONDS` | `15` | 流式响应首帧到达前的 SSE 心跳间隔（秒），`0` 或负数关闭 |
+| `TW2A_REFRESH_SKEW` | `72h` | token 预刷新窗口：到期前多久开始自动续期（config.json 键 `schedule.refresh_skew`） |
 | `TW2A_ERR_THRESHOLD` | `3` | 触发冷却前的连续错误次数 |
-| `TW2A_ERR_COOLDOWN` | `300` | 错误冷却时长（秒） |
+| `TW2A_ERR_COOLDOWN` | `10m` | 错误冷却时长（duration 字符串，如 `10m` / `600s`） |
+
+> 注：`upstream.keepalive_seconds`（流式首帧前的 SSE 心跳间隔，未设/0 = 默认 15s，负数 = 关闭）仅支持 `config.json` 配置，无对应环境变量。
 
 ## 安全声明
 
