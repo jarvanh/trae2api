@@ -726,8 +726,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			statsR := newChatStatsReaderSince(rc, st.start)
 			// 流内业务错误（1005 plan/5xx 等）→ 冷却账号，错误信息注入 SSE。
 			// Keepalive > 0 时在首帧到达前发 `: ping` 注释帧，防边缘网关静默掐断（502）。
-			_ = upstream.StreamWithKeepalive(w, statsR, func(se *upstream.SOLOStreamError) {
+			_ = upstream.StreamWithUsageKeepalive(w, statsR, func(se *upstream.SOLOStreamError) {
 				h.handleStreamError(acct.UID, se)
+			}, func(remain float64) {
+				// 流内记账（2026-10-16 定案）：notify_usage 账单事件 → 本地包账本
+				// FIFO 扣减。零额外上游请求，扣费后余额实时进 pool。
+				h.cfg.Pool.ApplyUsageRemain(acct.UID, remain)
 			}, h.cfg.Keepalive)
 			rc.Close()
 			if toks, ok := statsR.Tokens(); ok {
@@ -742,7 +746,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		resp, err := upstream.Aggregate(rc)
+		resp, notifyRemain, haveRemain, err := upstream.Aggregate(rc)
 		rc.Close() // 已完全消费，立即释放上游连接（防轮转 continue 泄漏 body）
 		if err != nil {
 			h.cfg.Pool.RecordError(acct.UID)
@@ -766,6 +770,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.cfg.Pool.RecordSuccess(acct.UID)
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
+		if haveRemain {
+			// 流内记账：非流式出口同样顺带拿扣费后余额（零额外上游请求）。
+			h.cfg.Pool.ApplyUsageRemain(acct.UID, notifyRemain)
+		}
 		noteUsage(st, usageRecord{
 			Dir: h.cfg.UsageDir, Model: peek.Model, Probe: probe, UID: acct.UID,
 			Status: http.StatusOK, Mode: "sync", In: promptTokens(resp), Out: max(st.toks, 0),

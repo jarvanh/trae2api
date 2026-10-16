@@ -186,23 +186,22 @@ func (s *Scheduler) RunCheckinNow() {
 	}
 }
 
-// probeNearestExpire 拉取权益包明细，把最早到期的未用完包时间注入 pool。
-// PackList 已按 expire_at 升序，取第一个还有余额的包即可。
+// probeNearestExpire 拉取权益包明细，全量写入本地包账本（Pool.SetPacks）。
+// 账本同步顺带重算 nearest_expire（规则①排序键）与 credits（各包 remain 合计）。
+// 两次探测之间的扣减由流内记账（notify_usage → ApplyUsageRemain）负责；
+// 本函数按主人 2026-10-16 定案保持每小时全量校正一次，签到轮同样走这里，
+// 均为「本来就要发的同一次请求」，零额外上游调用。
 func (s *Scheduler) probeNearestExpire(uid string, a *auth.Auth) {
 	packs, err := s.cfg.Upstream.PackList(a)
 	if err != nil {
 		log.Printf("pack-list %s: %v", uid, err)
 		return
 	}
+	ps := make([]pool.PackState, 0, len(packs))
 	for _, p := range packs {
-		if p.Limit-p.Used <= 0 {
-			continue // 已耗尽，跳过
-		}
-		s.cfg.Pool.SetNearestExpire(uid, p.ExpireAt)
-		return
+		ps = append(ps, pool.PackState{Desc: p.Desc, Limit: p.Limit, Used: p.Used, ExpireAt: p.ExpireAt})
 	}
-	// 名下已无未用完的包 → 置 0（未探测同义），不参与规则①竞争
-	s.cfg.Pool.SetNearestExpire(uid, 0)
+	s.cfg.Pool.SetPacks(uid, ps)
 }
 
 // RunExpireProbeLoop 规则①数据源保活：启动立即探测一轮，此后每隔 interval 探测一轮。

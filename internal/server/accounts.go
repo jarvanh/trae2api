@@ -35,6 +35,22 @@ type accountSummary struct {
 	MachineID    string `json:"machine_id,omitempty"` // 前 8 位（脱敏）
 	DeviceID     string `json:"device_id,omitempty"`  // 前 8 位（脱敏）
 	HasAuth      bool   `json:"has_auth"`
+
+	// 本地包账本（2026-10-16 流内记账定案）：数据源 pool 本地账本，
+	// 非上游实时 —— 每小时探测轮全量校正 + 每笔请求流内 FIFO 扣减。
+	// 只列未用完包（已按 expire_at 升序），与 TG 看板逐包展示同构。
+	Packs       []packSummary `json:"packs,omitempty"`
+	NearestDays *int          `json:"nearest_days,omitempty"`
+}
+
+// packSummary 本地包账本对外展示条目（与 admin.go 的 packItem 字段口径一致）。
+type packSummary struct {
+	Desc      string `json:"desc"`
+	Limit     int64  `json:"limit"`
+	Used      int64  `json:"used"`
+	Remain    int64  `json:"remain"`
+	ExpireAt  int64  `json:"expire_at"`
+	ExpireFmt string `json:"expire_fmt"`
 }
 
 // adminAccounts GET /admin/api/accounts：列表（无鉴权，只读）。
@@ -66,6 +82,25 @@ func (h *Handler) adminAccounts(w http.ResponseWriter, r *http.Request) {
 			}
 			sum.MachineID = prefix(a.MachineID, 8)
 			sum.DeviceID = prefix(a.DeviceID, 8)
+		}
+		// 本地包账本透出（无上游调用，纯内存读取）。
+		for _, pk := range h.cfg.Pool.Packs(s.UID) {
+			rem := pk.Limit - pk.Used
+			if rem <= 0 {
+				continue
+			}
+			sum.Packs = append(sum.Packs, packSummary{
+				Desc:      pk.Desc,
+				Limit:     pk.Limit,
+				Used:      pk.Used,
+				Remain:    rem,
+				ExpireAt:  pk.ExpireAt,
+				ExpireFmt: time.Unix(pk.ExpireAt, 0).In(beijing).Format("2006-01-02 15:04"),
+			})
+		}
+		if len(sum.Packs) > 0 {
+			d := int(time.Until(time.Unix(sum.Packs[0].ExpireAt, 0)).Hours() / 24)
+			sum.NearestDays = &d
 		}
 		out = append(out, sum)
 	}

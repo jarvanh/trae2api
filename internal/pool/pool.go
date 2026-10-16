@@ -9,6 +9,7 @@ package pool
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -21,6 +22,15 @@ import (
 // unknownExpire 未探测到权益包时的排序键：视为无穷远，排在所有已知账号之后。
 // 理由：宁可让已探明的临期账号先上，也不要让未知账号抢占位置。
 const unknownExpire int64 = 1 << 62
+
+// PackState 本地积分包账本条目（持久化于 state.json）。
+// 数据源：每小时探测轮的 upstream.PackList 全量校正 + 流内 notify_usage FIFO 扣减。
+type PackState struct {
+	Desc     string `json:"desc,omitempty"`
+	Limit    int64  `json:"limit"`
+	Used     int64  `json:"used"`
+	ExpireAt int64  `json:"expire_at"`
+}
 
 // CoolKind 冷却类型。
 type CoolKind int
@@ -77,6 +87,7 @@ type entry struct {
 	// 由 SetNearestExpire 注入（数据源 upstream.PackList），是挑选规则①的依据。
 	nearestExpire int64
 	credits       int64
+	packs         []PackState // 本地积分包账本（空 = 尚未同步，等每小时探测轮）
 	workCredits   float64
 	disabled      bool // session dead 硬禁用
 	enabled       bool // 用户软开关（默认 true），false 时 Pick 跳过
@@ -142,6 +153,10 @@ type stateEntry struct {
 	// 退化成规则②（积分最少者胜），积分最多的账号被结构性轮空
 	//（2026-10-16 事故：D 账号临期积分无法被优先消耗）。旧文件缺省为 0。
 	NearestExpire int64 `json:"nearest_expire,omitempty"`
+
+	// Packs 本地积分包账本（2026-10-16 流内记账定案）。旧文件缺省为空，
+	// 服务启动后的首轮探测（RunExpireProbeLoop 启动即探）即全量写入。
+	Packs []PackState `json:"packs,omitempty"`
 }
 
 // stateFile 持久化格式。
@@ -600,6 +615,95 @@ func (p *Pool) NearestExpire(uid string) int64 {
 	return 0
 }
 
+// SetPacks 全量替换账号积分包账本（数据源 upstream.PackList，已按 expire_at 升序）。
+// 同步重算 credits（各包 remain 合计，实测与上游总额一致）与 nearestExpire
+//（最早到期的未用完包；名下无未用完包置 0）。每小时探测轮的全量校正入口。
+func (p *Pool) SetPacks(uid string, packs []PackState) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	e.packs = packs
+	var total int64
+	e.nearestExpire = 0
+	for _, pk := range packs {
+		rem := pk.Limit - pk.Used
+		if rem <= 0 {
+			continue
+		}
+		total += rem
+		if e.nearestExpire == 0 || pk.ExpireAt < e.nearestExpire {
+			e.nearestExpire = pk.ExpireAt
+		}
+	}
+	e.credits = total
+	p.saveLocked()
+}
+
+// Packs 返回账号本地包账本副本（未同步过返回 nil）。
+func (p *Pool) Packs(uid string) []PackState {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if e, ok := p.byUID[uid]; ok && len(e.packs) > 0 {
+		out := make([]PackState, len(e.packs))
+		copy(out, e.packs)
+		return out
+	}
+	return nil
+}
+
+// ApplyUsageRemain 流内记账（2026-10-16 定案）：notify_usage 账单事件的扣费后余额。
+// delta = 旧额 − 新额，按临期优先从本地包账本 FIFO 扣减（与上游扣法一致，已实测）；
+// 账本缺失或对不平时只更新总额，漂移交给每小时探测轮校正 —— 绝不影响请求主流程。
+func (p *Pool) ApplyUsageRemain(uid string, remain float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	newTotal := int64(math.Round(remain))
+	delta := e.credits - newTotal
+	if delta < 0 {
+		delta = 0 // 涨额（签到/加包）不在此处理，交探测轮全量同步
+	}
+	if len(e.packs) > 0 && delta > 0 {
+		ps := make([]PackState, len(e.packs))
+		copy(ps, e.packs)
+		sort.Slice(ps, func(i, j int) bool { return ps[i].ExpireAt < ps[j].ExpireAt })
+		left := delta
+		for i := range ps {
+			if left <= 0 {
+				break
+			}
+			rem := ps[i].Limit - ps[i].Used
+			if rem <= 0 {
+				continue
+			}
+			take := rem
+			if take > left {
+				take = left
+			}
+			ps[i].Used += take
+			left -= take
+		}
+		e.packs = ps
+		e.nearestExpire = 0
+		for _, pk := range ps {
+			if pk.Limit-pk.Used <= 0 {
+				continue
+			}
+			if e.nearestExpire == 0 || pk.ExpireAt < e.nearestExpire {
+				e.nearestExpire = pk.ExpireAt
+			}
+		}
+	}
+	e.credits = newTotal
+	p.saveLocked()
+}
+
 // SetCredits 更新账号积分。
 func (p *Pool) SetCredits(uid string, credits int64) {
 	p.mu.Lock()
@@ -766,6 +870,7 @@ func (p *Pool) load() {
 			credits:           s.Credits,
 			workCredits:       wc,
 			nearestExpire:     s.NearestExpire,
+			packs:             s.Packs,
 			disabled:          s.Disabled,
 			enabled:           enabled,
 			reason:            s.Reason,
@@ -788,6 +893,7 @@ func (p *Pool) saveLocked() {
 		se := stateEntry{
 			Credits:           e.credits,
 			NearestExpire:     e.nearestExpire,
+			Packs:             e.packs,
 			Disabled:          e.disabled,
 			Reason:            e.reason,
 			Until:             e.until,
@@ -911,4 +1017,14 @@ func (p *Pool) NoteCheckinChecked(uid string) {
 		e.checkinRetryCount = 0
 	}
 	p.saveLocked()
+}
+
+// Credits 返回账号当前积分总额（本地账本合计或最近一次外部注入值）。
+func (p *Pool) Credits(uid string) int64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if e, ok := p.byUID[uid]; ok {
+		return e.credits
+	}
+	return 0
 }

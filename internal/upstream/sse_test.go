@@ -84,7 +84,7 @@ const soloSSEFixture = "id:1\nevent:metadata\ndata:{\"model\":\"\",\"session_id\
 	"event:done\ndata:{\"finish_reason\":\"stop\"}\n\n"
 
 func TestAggregateSOLO(t *testing.T) {
-	resp, err := Aggregate(strings.NewReader(soloSSEFixture))
+	resp, _, _, err := Aggregate(strings.NewReader(soloSSEFixture))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,7 @@ func TestAggregateSOLO(t *testing.T) {
 func TestAggregateSOLOError(t *testing.T) {
 	raw := "event:error\ndata:{\"code\":4001,\"message\":\"We're sorry, the param is invalid.\",\"extra\":null}\n\n" +
 		"event:done\ndata:{\"finish_reason\":\"stop\"}\n\n"
-	_, err := Aggregate(strings.NewReader(raw))
+	_, _, _, err := Aggregate(strings.NewReader(raw))
 	if err == nil {
 		t.Fatal("want error from event:error")
 	}
@@ -137,7 +137,7 @@ func TestParseSOLOLine(t *testing.T) {
 func TestAggregateSOLOToolCalls(t *testing.T) {
 	raw := "event:output\ndata:{\"response\":\"\",\"reasoning_content\":\"\",\"tool_calls\":[{\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"北京\\\"}\"},\"index\":0}]}\n\n" +
 		"event:done\ndata:{\"finish_reason\":\"tool_calls\"}\n\n"
-	resp, err := Aggregate(strings.NewReader(raw))
+	resp, _, _, err := Aggregate(strings.NewReader(raw))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,5 +326,39 @@ func TestScanLineIgnoresPing(t *testing.T) {
 	}
 	if st.event != "" || st.data.Len() != 0 {
 		t.Errorf("ping comment mutated state: event=%q data=%q", st.event, st.data.String())
+	}
+}
+
+func TestParseSOLOLineNotifyUsage(t *testing.T) {
+	// 形态 1：cn_credits_remain_info 为对象
+	ev, err := ParseSOLOLine("notify_usage", `{"cn_credits_remain_info":{"ide_credits":4126.6666666,"work_credits":2000}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ev.HasUsageRemain || ev.UsageRemain < 4126.6 || ev.UsageRemain > 4126.7 {
+		t.Errorf("obj form: %+v", ev)
+	}
+	// 形态 2：cn_credits_remain_info 为 JSON 字符串（上游两种形态都出现过）
+	ev, err = ParseSOLOLine("notify_usage", `{"cn_credits_remain_info":"{\"ide_credits\":83}"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ev.HasUsageRemain || ev.UsageRemain != 83 {
+		t.Errorf("str form: %+v", ev)
+	}
+	// 缺字段 → 不置位
+	ev, err = ParseSOLOLine("notify_usage", `{"foo":1}`)
+	if err != nil || ev.HasUsageRemain {
+		t.Errorf("missing field: %+v err=%v", ev, err)
+	}
+}
+
+func TestAggregateNotifyUsage(t *testing.T) {
+	raw := "event:output\ndata:{\"response\":\"ok\"}\n\n" +
+		"event:notify_usage\ndata:{\"cn_credits_remain_info\":{\"ide_credits\":4126.5}}\n\n" +
+		"event:done\ndata:{\"finish_reason\":\"stop\"}\n\n"
+	_, remain, have, err := Aggregate(strings.NewReader(raw))
+	if err != nil || !have || remain != 4126.5 {
+		t.Errorf("remain=%v have=%v err=%v", remain, have, err)
 	}
 }

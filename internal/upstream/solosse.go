@@ -36,7 +36,7 @@ import (
 
 // SOLOEvent 单条 SOLO SSE 事件（归一化）。
 type SOLOEvent struct {
-	Event        string          // metadata | timing_cost | output | extra_info | token_usage | done | error
+	Event        string          // metadata | timing_cost | output | extra_info | token_usage | notify_usage | done | error
 	Response     string          // output: content 增量
 	Reasoning    string          // output: 思考链增量
 	ToolCalls    json.RawMessage // output: 工具调用（null 或对象/数组）
@@ -44,6 +44,12 @@ type SOLOEvent struct {
 	FinishReason string          // done
 	ErrorCode    int64           // error
 	ErrorMessage string          // error
+
+	// notify_usage 账单事件：cn_credits_remain_info.ide_credits = 本笔扣费后的
+	// 精确余额（浮点）。这是「流内记账」的数据源（2026-10-16 定案）：主链路
+	// 顺带解析即可拿到扣费后余额，无需任何额外上游探测请求。
+	HasUsageRemain bool
+	UsageRemain    float64
 }
 
 // SOLOStreamError 上游 SSE 流内的业务错误（event:error）。非流式聚合时返回，
@@ -91,6 +97,26 @@ func ParseSOLOLine(eventName, dataLine string) (*SOLOEvent, error) {
 		}
 	case "token_usage":
 		ev.Usage = raw
+	case "notify_usage":
+		// 账单事件（实测）：data 里 cn_credits_remain_info 可能是对象，也可能是
+		// JSON 字符串（上游两形态都出现过），两种都兼容。
+		infoRaw, ok := raw["cn_credits_remain_info"]
+		if !ok {
+			return ev, nil
+		}
+		info, ok := infoRaw.(map[string]any)
+		if !ok {
+			if s, isStr := infoRaw.(string); isStr {
+				var parsed map[string]any
+				if json.Unmarshal([]byte(s), &parsed) == nil {
+					info = parsed
+				}
+			}
+		}
+		if v, ok := info["ide_credits"].(float64); ok {
+			ev.HasUsageRemain = true
+			ev.UsageRemain = v
+		}
 	case "done":
 		if v, ok := raw["finish_reason"].(string); ok {
 			ev.FinishReason = v
@@ -144,7 +170,9 @@ func scanLine(st *sseState, line string) *SOLOEvent {
 
 // Aggregate 读取完整 SOLO SSE，聚合 response + reasoning + tool_calls + usage，
 // 产出单个 OpenAI chat.completion（非流式）。
-func Aggregate(r io.Reader) (map[string]any, error) {
+// 返回值 notifyRemain / haveRemain：流内 notify_usage 账单事件的扣费后余额
+//（ide_credits）。haveRemain=false 表示本流没带账单事件（探测/异常流），调用方跳过记账。
+func Aggregate(r io.Reader) (resp map[string]any, notifyRemain float64, haveRemain bool, err error) {
 	br := bufio.NewReaderSize(r, 64*1024)
 	var (
 		id           string
@@ -160,7 +188,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil && err != io.EOF {
-			return nil, err
+			return nil, 0, false, err
 		}
 		if ev := scanLine(st, strings.TrimRight(line, "\r\n")); ev != nil {
 			switch ev.Event {
@@ -174,6 +202,11 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 				mergeToolCallJSON(toolCalls, &toolOrder, ev.ToolCalls)
 			case "token_usage":
 				usage = ev.Usage
+			case "notify_usage":
+				if ev.HasUsageRemain {
+					notifyRemain = ev.UsageRemain
+					haveRemain = true
+				}
 			case "done":
 				if ev.FinishReason != "" {
 					finishReason = ev.FinishReason
@@ -187,7 +220,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		}
 	}
 	if upstreamErr != nil {
-		return nil, upstreamErr
+		return nil, notifyRemain, haveRemain, upstreamErr
 	}
 	if id == "" {
 		id = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
@@ -207,7 +240,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		}
 		message["tool_calls"] = calls
 	}
-	resp := map[string]any{
+	resp = map[string]any{
 		"id":      id,
 		"object":  "chat.completion",
 		"created": time.Now().Unix(),
@@ -223,7 +256,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 	if usage != nil {
 		resp["usage"] = usage
 	}
-	return resp, nil
+	return resp, notifyRemain, haveRemain, nil
 }
 
 // mergeToolCallJSON 把 SOLO output.tool_calls（json.RawMessage，可能 null/对象/数组）
@@ -309,13 +342,13 @@ func sortInts(a []int) {
 // Stream 流式转换：SOLO SSE → OpenAI SSE chunk，每 chunk flush，保证至少一个 [DONE]。
 // 调用方必须先设置过 status 200；本函数自设 SSE headers。
 func Stream(w http.ResponseWriter, r io.Reader) error {
-	return streamOpts(w, r, nil, 0)
+	return streamOpts(w, r, nil, nil, 0)
 }
 
 // StreamWithError 同 Stream，额外在遇到上游 event:error 时回调 onErr（非 nil），
 // 供调用方冷却账号/记录日志；错误信息同时注入 SSE 事件流。
 func StreamWithError(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)) error {
-	return streamOpts(w, r, onErr, 0)
+	return streamOpts(w, r, onErr, nil, 0)
 }
 
 // StreamWithKeepalive 同 StreamWithError，额外在「首个真实帧到达前」按 keepalive
@@ -325,11 +358,19 @@ func StreamWithError(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamE
 // 注释帧是 SSE 标准规定的心跳形态，scanLine 已忽略 `:` 前缀行，对解析零副作用。
 // keepalive <= 0 表示关闭（等同 StreamWithError）。
 func StreamWithKeepalive(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError), keepalive time.Duration) error {
-	return streamOpts(w, r, onErr, keepalive)
+	return streamOpts(w, r, onErr, nil, keepalive)
 }
 
-// streamOpts Stream 的可选参数版本。keepalive > 0 时启用首帧前心跳。
-func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError), keepalive time.Duration) error {
+// StreamWithUsageKeepalive 同 StreamWithKeepalive，额外在流内出现 notify_usage
+// 账单事件时回调 onUsage(扣费后余额) —— 流内记账入口（2026-10-16 定案）：
+// 主链路顺带拿到精确余额，零额外上游请求。onUsage 为 nil 时等同 StreamWithKeepalive。
+func StreamWithUsageKeepalive(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError), onUsage func(remain float64), keepalive time.Duration) error {
+	return streamOpts(w, r, onErr, onUsage, keepalive)
+}
+
+// streamOpts Stream 的可选参数版本。keepalive > 0 时启用首帧前心跳；
+// onUsage 非 nil 时在 notify_usage 账单事件处回调（扣费后余额）。
+func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError), onUsage func(remain float64), keepalive time.Duration) error {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -460,6 +501,11 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 				}
 			case "token_usage":
 				pendingUsage = ev.Usage
+			case "notify_usage":
+				// 账单事件：回调流内记账（不转发客户端，对其透明）。
+				if onUsage != nil && ev.HasUsageRemain {
+					onUsage(ev.UsageRemain)
+				}
 			case "done":
 				if err := writeChunk(map[string]any{}, ev.FinishReason); err != nil {
 					return err

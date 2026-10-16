@@ -521,3 +521,51 @@ func TestPickAffinity(t *testing.T) {
 		t.Fatalf("expected failover to u2, got %+v", got4)
 	}
 }
+
+func TestSetPacksAndApplyUsageRemain(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	// 两个包：临期包 150（remain 83）+ 后包 100（remain 100）→ credits 合计 183
+	p.SetPacks("u1", []PackState{
+		{Desc: "签到奖励", Limit: 150, Used: 67, ExpireAt: 2000000000},
+		{Desc: "签到奖励", Limit: 100, Used: 0, ExpireAt: 2500000000},
+	})
+	if got := p.NearestExpire("u1"); got != 2000000000 {
+		t.Fatalf("nearest=%d", got)
+	}
+	if got := p.Packs("u1"); len(got) != 2 {
+		t.Fatalf("packs=%d", len(got))
+	}
+	// 流内记账：新总额 50 → 扣 133。FIFO：先扣临期包 83 剩余，再扣后包 50
+	p.ApplyUsageRemain("u1", 50)
+	ps := p.Packs("u1")
+	if ps[0].Used != 150 || ps[0].Limit-ps[0].Used != 0 {
+		t.Errorf("pack0 used=%d/%d", ps[0].Used, ps[0].Limit)
+	}
+	if ps[1].Used != 50 || ps[1].Limit-ps[1].Used != 50 {
+		t.Errorf("pack1 used=%d/%d", ps[1].Used, ps[1].Limit)
+	}
+	// 临期包耗尽 → nearest 切到后包
+	if got := p.NearestExpire("u1"); got != 2500000000 {
+		t.Fatalf("nearest after drain=%d", got)
+	}
+	// 涨额（签到加包）：只更新总额，不动账本（等探测轮全量同步）
+	p.ApplyUsageRemain("u1", 250)
+	if got := p.Credits("u1"); got != 250 {
+		t.Fatalf("credits after gain=%d", got)
+	}
+}
+
+func TestApplyUsageRemainNoLedger(t *testing.T) {
+	// 无账本（未探测过）：只更新总额，不报错、不建账
+	p := New("")
+	p.Add(&auth.Auth{UID: "u2"})
+	p.SetCredits("u2", 100)
+	p.ApplyUsageRemain("u2", 61)
+	if got := p.Credits("u2"); got != 61 {
+		t.Fatalf("credits=%d", got)
+	}
+	if ps := p.Packs("u2"); ps != nil {
+		t.Fatalf("unexpected packs: %+v", ps)
+	}
+}
