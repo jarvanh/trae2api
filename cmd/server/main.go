@@ -94,6 +94,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
+	// 规则①（最早过期优先）数据源保活：启动即探测 + 每小时探测，
+	// 配合 nearest_expire 落盘，保证重启后选号规则①立即生效（2026-10-16 事故治本）。
+	go sch.RunExpireProbeLoop(ctx, time.Hour)
 
 	// 启动时在后台探测所有可用账号的 work_credits 积分状态
 	if workClient.Mode() != upstream.WorkModeDisabled {

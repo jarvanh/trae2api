@@ -84,6 +84,24 @@ func TestSetNearestExpire(t *testing.T) {
 	}
 }
 
+// nearest_expire 必须落盘并在重启（重新 load）后恢复 —— 规则①数据源，
+// 2026-10-16 事故回归测试：重启清零 → 规则①失效 → 积分最多账号被轮空。
+func TestNearestExpirePersistence(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	ts := time.Now().Add(26 * time.Hour).Unix()
+	p.SetNearestExpire("u1", ts)
+
+	// 模拟重启：用同一状态文件重建池
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	if got := p2.NearestExpire("u1"); got != ts {
+		t.Fatalf("nearest=%d want %d (must survive restart)", got, ts)
+	}
+}
+
 func TestPickSkipsCooling(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})

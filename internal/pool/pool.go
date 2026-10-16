@@ -136,6 +136,12 @@ type stateEntry struct {
 	CheckinGen        int       `json:"checkin_device_gen,omitempty"`
 	CheckinRetryAfter time.Time `json:"checkin_retry_after,omitempty"`
 	CheckinRetryCount int       `json:"checkin_retry_count,omitempty"`
+
+	// 最早到期的未用完权益包时间（Unix 秒；0=未探测）。必须落盘：
+	// 选号规则①（最早过期优先）的唯一数据源，重启清零会让规则①失效、
+	// 退化成规则②（积分最少者胜），积分最多的账号被结构性轮空
+	//（2026-10-16 事故：D 账号临期积分无法被优先消耗）。旧文件缺省为 0。
+	NearestExpire int64 `json:"nearest_expire,omitempty"`
 }
 
 // stateFile 持久化格式。
@@ -578,7 +584,10 @@ func (p *Pool) SetNearestExpire(uid string, expireAt int64) {
 	if e, ok := p.byUID[uid]; ok {
 		e.nearestExpire = expireAt
 	}
-	// 排序键是上游派生数据，不落 state.json（重启后由刷新循环重新探测）
+	// 上游派生数据但必须落盘：规则①（最早过期优先）的唯一排序键，
+	// 不落盘重启即清零 → 规则①失效退化规则②（2026-10-16 事故根因）。
+	// 保活：启动即探测 + 每小时探测循环 + 每日签到轮三重刷新。
+	p.saveLocked()
 }
 
 // NearestExpire 返回账号当前的最早到期时间（0 表示未探测）。
@@ -756,6 +765,7 @@ func (p *Pool) load() {
 			a:                 &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
 			credits:           s.Credits,
 			workCredits:       wc,
+			nearestExpire:     s.NearestExpire,
 			disabled:          s.Disabled,
 			enabled:           enabled,
 			reason:            s.Reason,
@@ -777,6 +787,7 @@ func (p *Pool) saveLocked() {
 	for uid, e := range p.byUID {
 		se := stateEntry{
 			Credits:           e.credits,
+			NearestExpire:     e.nearestExpire,
 			Disabled:          e.disabled,
 			Reason:            e.reason,
 			Until:             e.until,

@@ -205,6 +205,45 @@ func (s *Scheduler) probeNearestExpire(uid string, a *auth.Auth) {
 	s.cfg.Pool.SetNearestExpire(uid, 0)
 }
 
+// RunExpireProbeLoop 规则①数据源保活：启动立即探测一轮，此后每隔 interval 探测一轮。
+//
+// 2026-10-16 事故：nearest_expire 只在每日 09:00 签到轮探测且不落盘，环境重置 /
+// 容器重启后全账号退化为「未探测」，选号规则①（最早过期优先）失效 → 退规则②
+// 「积分最少者胜」，积分最多的账号被结构性轮空，临期积分白白过期作废。
+// 现在落盘 + 本循环（启动即探 + 每小时保活）+ 签到轮三重保活。
+// 单轮失败只记日志：保留旧值/未探测状态，下一轮自愈，绝不影响服务主流程。
+func (s *Scheduler) RunExpireProbeLoop(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = time.Hour
+	}
+	s.probeAllNearestExpire()
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.probeAllNearestExpire()
+		}
+	}
+}
+
+// probeAllNearestExpire 对所有未禁用账号探测最早到期权益包。
+// 冷却中的账号也参与探测（与签到轮同口径）：它们解冻后需要立即可用的排序键。
+func (s *Scheduler) probeAllNearestExpire() {
+	for _, st := range s.cfg.Pool.List() {
+		if st.Disabled {
+			continue
+		}
+		a := s.cfg.Pool.AuthByUID(st.UID)
+		if a == nil || a.RefreshTokenValue() == "" {
+			continue
+		}
+		s.probeNearestExpire(st.UID, a)
+	}
+}
+
 // RunRefreshNow 立即对所有账号刷新 token；session 失效的自动禁用。
 func (s *Scheduler) RunRefreshNow() {
 	for _, st := range s.cfg.Pool.List() {
