@@ -313,6 +313,51 @@ func expireKey(e *entry) int64 {
 	return e.nearestExpire
 }
 
+// affinityExpireSlack 临期压制阈值：绑定账号的最早到期比全局最优账号晚超过该值，
+// 就放弃会话粘性、改绑到更临期的账号。取 1h 是为了避免到期时间接近的两个账号
+// 反复互抢（微抖动），同时保证「先烧临期积分」这条规则①不被粘性长期架空。
+const affinityExpireSlack = time.Hour
+
+// expirePressure 判断 best 是否比 bound 明显更临期，需要抢占会话粘性。
+//
+// 背景（2026-10-23 事故）：PickAffinity 原先只看绑定账号是否 healthy，
+// 一次 4001 错误风暴把 D 号打冷却、粘性被重写到到期最晚的 175 号；
+// 冷却恢复后绑定不回切，导致临期积分整日无人消耗。此处用「到期压力」
+// 在每次复用绑定前做一次规则①校正。
+//
+// bound 未探测（0）视为无穷远：任何已探明到期的 best 都构成压制。
+func expirePressure(best, bound *entry) bool {
+	if best == nil || bound == nil || best == bound {
+		return false
+	}
+	if best.nearestExpire <= 0 {
+		return false
+	}
+	if bound.nearestExpire <= 0 {
+		return true
+	}
+	return best.nearestExpire+int64(affinityExpireSlack/time.Second) < bound.nearestExpire
+}
+
+// bestByRuleLocked 按规则序返回最优健康账号（只读，不修改 lastUsed / 绑定）。
+// 与 PickExcluding 同口径，供临期压制判断使用。
+func (p *Pool) bestByRuleLocked(tried map[string]bool, now time.Time) *entry {
+	var best *entry
+	var bestUID string
+	for uid, e := range p.byUID {
+		if tried != nil && tried[uid] {
+			continue
+		}
+		if !e.healthy(now) {
+			continue
+		}
+		if best == nil || betterEntry(e, best, uid, bestUID) {
+			best, bestUID = e, uid
+		}
+	}
+	return best
+}
+
 // betterEntry 严格规则序比较（非加权）：两条规则依次判定，
 // 前一条定不出胜负才看下一条，全部并列则比 UID 保证结果稳定。
 //
@@ -420,6 +465,13 @@ func (p *Pool) PickAffinity(sessionKey string, tried map[string]bool) *auth.Auth
 		if aff, ok := p.affinity[sessionKey]; ok {
 			if tried == nil || !tried[aff.uid] {
 				if e, exists := p.byUID[aff.uid]; exists && e.healthy(now) {
+					// 临期压制：若存在明显更早到期的健康账号，放弃粘性改绑。
+					// 只按到期时间判定，不掺积分/UID —— 规则①优先于缓存收益。
+					if best := p.bestByRuleLocked(tried, now); expirePressure(best, e) {
+						p.affinity[sessionKey] = affinityEntry{uid: best.a.UID, lastSeen: now}
+						best.lastUsed = now
+						return best.a
+					}
 					aff.lastSeen = now
 					p.affinity[sessionKey] = aff
 					e.lastUsed = now
@@ -617,7 +669,7 @@ func (p *Pool) NearestExpire(uid string) int64 {
 
 // SetPacks 全量替换账号积分包账本（数据源 upstream.PackList，已按 expire_at 升序）。
 // 同步重算 credits（各包 remain 合计，实测与上游总额一致）与 nearestExpire
-//（最早到期的未用完包；名下无未用完包置 0）。每小时探测轮的全量校正入口。
+// （最早到期的未用完包；名下无未用完包置 0）。每小时探测轮的全量校正入口。
 func (p *Pool) SetPacks(uid string, packs []PackState) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

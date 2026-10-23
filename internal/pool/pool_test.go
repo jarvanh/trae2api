@@ -522,6 +522,79 @@ func TestPickAffinity(t *testing.T) {
 	}
 }
 
+// TestPickAffinityExpirePressure 覆盖 2026-10-23 事故：错误风暴把会话粘性
+// 劫持到到期最晚的账号后，冷却恢复时必须按规则①改回临期账号。
+func TestPickAffinityExpirePressure(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "late"})
+	p.Add(&auth.Auth{UID: "soon"})
+	now := time.Now()
+	p.SetPacks("late", []PackState{{Desc: "签到奖励", Limit: 100, ExpireAt: now.Add(30 * 24 * time.Hour).Unix()}})
+	p.SetPacks("soon", []PackState{{Desc: "签到奖励", Limit: 100, ExpireAt: now.Add(2 * time.Hour).Unix()}})
+
+	// 新会话按规则①选中临期账号
+	if got := p.PickAffinity("sess-1", nil); got == nil || got.UID != "soon" {
+		t.Fatalf("expected soon, got %+v", got)
+	}
+
+	// 模拟 4001 风暴：临期账号冷却，粘性漂移到 late
+	p.Cooldown("soon", CoolSoft, time.Minute, "consecutive errors")
+	if got := p.PickAffinity("sess-1", nil); got == nil || got.UID != "late" {
+		t.Fatalf("expected failover to late, got %+v", got)
+	}
+
+	// 冷却恢复：临期压制应把粘性改回 soon，而不是永久钉在 late
+	p.Cooldown("soon", CoolSoft, 0, "")
+	if got := p.PickAffinity("sess-1", nil); got == nil || got.UID != "soon" {
+		t.Fatalf("expected expire pressure to switch back to soon, got %+v", got)
+	}
+	// 改绑后应保持（soon 仍是最临期）
+	if got := p.PickAffinity("sess-1", nil); got == nil || got.UID != "soon" {
+		t.Fatalf("expected sticky soon, got %+v", got)
+	}
+}
+
+// TestPickAffinityExpireSlack 到期时间接近（<1h）时不抢粘性，避免两账号互抖。
+func TestPickAffinityExpireSlack(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "a"})
+	p.Add(&auth.Auth{UID: "b"})
+	now := time.Now()
+	p.SetPacks("a", []PackState{{Desc: "签到奖励", Limit: 100, ExpireAt: now.Add(2 * time.Hour).Unix()}})
+	p.SetPacks("b", []PackState{{Desc: "签到奖励", Limit: 100, ExpireAt: now.Add(150 * time.Minute).Unix()}})
+
+	// a 冷却时把 sess-1 绑到 b
+	p.Cooldown("a", CoolSoft, time.Minute, "test")
+	if got := p.PickAffinity("sess-1", nil); got == nil || got.UID != "b" {
+		t.Fatalf("expected b, got %+v", got)
+	}
+
+	// a 恢复：仅早 30 分钟 < 1h 阈值 → 保持粘性
+	p.Cooldown("a", CoolSoft, 0, "")
+	if got := p.PickAffinity("sess-1", nil); got == nil || got.UID != "b" {
+		t.Fatalf("expected sticky b within slack, got %+v", got)
+	}
+}
+
+// TestPickAffinityUnknownExpire 绑定账号未探测到期（0）时，已知到期的账号构成压制。
+func TestPickAffinityUnknownExpire(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "unknown"})
+	p.Add(&auth.Auth{UID: "known"})
+	p.SetCredits("unknown", 100)
+	p.SetCredits("known", 200)
+
+	// 两者都未探测到期 → 规则②先绑到积分更少的 unknown
+	if got := p.PickAffinity("sess-1", nil); got == nil || got.UID != "unknown" {
+		t.Fatalf("expected unknown, got %+v", got)
+	}
+	// known 探测到到期后，绑定账号（到期未知）应被压制，改绑 known
+	p.SetPacks("known", []PackState{{Desc: "签到奖励", Limit: 200, ExpireAt: time.Now().Add(48 * time.Hour).Unix()}})
+	if got := p.PickAffinity("sess-1", nil); got == nil || got.UID != "known" {
+		t.Fatalf("expected known by expire pressure, got %+v", got)
+	}
+}
+
 func TestSetPacksAndApplyUsageRemain(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
