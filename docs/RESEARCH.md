@@ -20,7 +20,18 @@
 ## 2. SOLO 通道机制
 
 - 对话端点：`POST https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat`
-- 关键参数：`function: "solo_work_lite"`（实测：其他 function 值如 `work`/`solo`/`work_lite` 均无效）
+- 关键参数：`function`。**2026-08 的结论需修正**：当时只试了 `work`/`solo`/`work_lite`（确实无效），
+  但 `solo_agent` 与 `chat_v3` 同样可用，且能力差别很大（2026-10-26 实测）：
+
+  | function | get_detail_param 返回 | `glm-5.3` 能力 | 备注 |
+  |---|---|---|---|
+  | `solo_work_lite` | 48 配置 | 200K / 168K 入 / 32K 出 | 无 `max` 档，`display_config.max_mode=false` |
+  | `solo_agent` | 69 配置（41 面向用户） | dev 200K；**`__max` 档 1M / 936K 入 / 64K 出** | `max_mode=true` |
+  | `chat_v3` | 59 配置 | dev 仅 116K；`__max` 档同上 1M | IDE 对话通道 |
+
+  实测「裸 `config_name`（不带 `__max`、不发 `extra_info.v2_max_mode_enabled`）在
+  `solo_agent` 下即可吃下 930K 输入并正确召回首尾双针」，即上游按 config_name 自行选档。
+  本仓库默认已切到 `solo_agent`（`upstream.function` 可回滚）。
 - 模型表：`POST /api/ide/v1/get_detail_param`（`config_name` 列表，动态下发）
 - 鉴权：`Cloud-IDE-JWT <accessToken>` + `X-Cloudide-Token` + `X-Uid` + `X-Machine-Id` / `X-Device-Id`
 - token 获取：`refreshToken` → `ExchangeToken`（轮换 refresh）→ `GetUserInfo`（uid）

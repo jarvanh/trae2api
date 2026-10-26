@@ -42,6 +42,12 @@ func main() {
 	if tr, ok := up.StreamHTTP.Transport.(*http.Transport); ok {
 		tr.ResponseHeaderTimeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
 	}
+	// function 通道：留空沿用默认（solo_agent，带 __max 档 = 1M 窗口）；
+	// 显式配置 solo_work_lite 可回滚旧的免费引流通道（最高 200K）。
+	if cfg.Upstream.Function != "" {
+		up.Function = cfg.Upstream.Function
+	}
+	log.Printf("upstream function=%s", up.Function)
 
 	workCfg := upstream.DefaultWorkClientConfig()
 	if cfg.WorkHost != "" {

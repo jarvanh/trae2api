@@ -100,7 +100,10 @@ func TestFetchModelsParsesContextWindow(t *testing.T) {
 			 "model_detail_list":[{"model_name":"y","prompt_max_tokens":1000000,"max_tokens":128000}]},
 			{"config_name":"m3",
 			 "context_window_tokens":{"dev":184000,"max":184000},
-			 "model_detail_list":[{"model_name":"z","prompt_max_tokens":168000,"max_tokens":16000}]}
+			 "model_detail_list":[{"model_name":"z","prompt_max_tokens":168000,"max_tokens":16000}]},
+			{"config_name":"m4","is_invisible_to_user":true,
+			 "context_window_tokens":{"dev":200000},
+			 "model_detail_list":[{"model_name":"w","prompt_max_tokens":168000,"max_tokens":32000}]}
 		]}`), nil
 	})
 	infos, err := c.FetchModels(&auth.Auth{AccessToken: "at"})
@@ -121,6 +124,17 @@ func TestFetchModelsParsesContextWindow(t *testing.T) {
 		{"m2", 1000000, 1000000, 128000}, // context_window_tokens 为空 → prompt_max_tokens
 		{"m3", 184000, 168000, 16000},    // 多环境键取最大值
 	}
+	// invisible 配置仍要出现在 FetchModels 结里（路由需要知道它存在），
+	// 只是标上 Invisible；展示过滤在 server 层做。
+	m4, ok := byID["m4"]
+	if !ok {
+		t.Error("is_invisible_to_user=true 的配置仍应返回（供路由使用）")
+	} else if !m4.Invisible {
+		t.Error("m4 Invisible 应为 true")
+	}
+	if m1 := byID["m1"]; m1.Invisible {
+		t.Error("m1 未标 is_invisible_to_user，Invisible 应为 false")
+	}
 	for _, c := range cases {
 		mi, ok := byID[c.id]
 		if !ok {
@@ -135,6 +149,53 @@ func TestFetchModelsParsesContextWindow(t *testing.T) {
 		if mi.MaxTokens != c.maxWant {
 			t.Errorf("%s max=%d want %d", c.id, mi.MaxTokens, c.maxWant)
 		}
+	}
+}
+
+// TestFetchModelsSelectsMaxTier 覆盖 solo_agent 通道的 __dev/__max 双档：
+// 必须报容量最大的那档（实测裸 config_name 请求即可吃下 max 档），
+// 且窗口不得小于所选档的输入上限。
+func TestFetchModelsSelectsMaxTier(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"config_info_list":[
+			{"config_name":"glm-5.3","display_config":{"display_name":"GLM-5.3"},
+			 "context_window_tokens":{"dev":200000,"max":1000000},
+			 "model_detail_list":[
+			   {"model_name":"glm-5.3__dev","prompt_max_tokens":168000,"max_tokens":32000},
+			   {"model_name":"glm-5.3__max","prompt_max_tokens":936000,"max_tokens":64000}]},
+			{"config_name":"onlydev","context_window_tokens":{"dev":200000},
+			 "model_detail_list":[
+			   {"model_name":"onlydev__dev","prompt_max_tokens":168000,"max_tokens":32000}]}
+		]}`), nil
+	})
+	infos, err := c.FetchModels(&auth.Auth{AccessToken: "at"})
+	if err != nil {
+		t.Fatalf("fetch models: %v", err)
+	}
+	byID := make(map[string]ModelInfo, len(infos))
+	for _, mi := range infos {
+		byID[mi.ID] = mi
+	}
+	g := byID["glm-5.3"]
+	if g.ContextWindow != 1000000 || g.PromptMaxTokens != 936000 || g.MaxTokens != 64000 {
+		t.Errorf("glm-5.3 = %+v want {1000000 936000 64000}（应取 __max 档）", g)
+	}
+	if o := byID["onlydev"]; o.ContextWindow != 200000 || o.PromptMaxTokens != 168000 {
+		t.Errorf("onlydev = %+v want {200000 168000}", o)
+	}
+}
+
+// TestClientFunctionOverride 验证 function 可配置：显式设置走设置值，
+// 空值回落默认常量（保证 config 笔误不会把空字符串发给上游）。
+func TestClientFunctionOverride(t *testing.T) {
+	if got := (&Client{}).function(); got != Function {
+		t.Errorf("empty Function should fall back to %q, got %q", Function, got)
+	}
+	if got := (&Client{Function: FunctionWorkLite}).function(); got != FunctionWorkLite {
+		t.Errorf("override got %q want %q", got, FunctionWorkLite)
+	}
+	if got := (&Client{Function: "  "}).function(); got != Function {
+		t.Errorf("blank override should fall back, got %q", got)
 	}
 }
 
@@ -239,7 +300,7 @@ func TestChatStreamSendsHeadersAndRewritesBody(t *testing.T) {
 	if gotAppID != AppID || gotIdeVer != IdeVersion {
 		t.Errorf("app headers: appid=%q idever=%q", gotAppID, gotIdeVer)
 	}
-	if !bytes.Contains(gotBody, []byte(`"stream":true`)) || !bytes.Contains(gotBody, []byte(`"function":"solo_work_lite"`)) {
+	if want := `"function":"` + Function + `"`; !bytes.Contains(gotBody, []byte(`"stream":true`)) || !bytes.Contains(gotBody, []byte(want)) {
 		t.Errorf("body not rewritten: %s", gotBody)
 	}
 }

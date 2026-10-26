@@ -51,6 +51,10 @@ type Config struct {
 		// 用于防止边缘网关（volc-dcdn/tengine）因长排队窗口连接静默而提前掐断（502）。
 		// 0 = 关闭心跳（等同旧行为）。
 		KeepaliveSeconds int `json:"keepalive_seconds"` // 15
+		// Function 上游 function 通道。留空 = 用 upstream.Function 默认值（solo_agent，
+		// 带 __max 档 = 1M 窗口）。显式填 "solo_work_lite" 可回滚到旧通道
+		// （无 max 档，glm-5.3 只有 200K/168K/32K）。
+		Function string `json:"function"`
 	} `json:"upstream"`
 
 	// 解析后的 duration。
@@ -175,6 +179,9 @@ func applyEnv(c *Config) {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Upstream.TimeoutSeconds = n
 		}
+	}
+	if v := os.Getenv("TW2A_FUNCTION"); v != "" {
+		c.Upstream.Function = strings.TrimSpace(v)
 	}
 }
 

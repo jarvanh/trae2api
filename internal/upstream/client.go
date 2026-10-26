@@ -135,6 +135,9 @@ type Client struct {
 	UgHost    string // https://api.trae.cn
 	OAuthHost string // https://api.trae.com.cn
 	ClientID  string // en1oxy7wnw8j9n
+	// Function 上游 function 通道；空 = 用默认常量 Function（solo_agent）。
+	// solo_agent 带 max 档（glm-5.3 = 1M/936K/64K），solo_work_lite 只有 200K/168K/32K。
+	Function string
 }
 
 // New 生产默认值。配置连接池减少 TLS 握手。
@@ -152,12 +155,27 @@ func New() *Client {
 		UgHost:     UgHost,
 		OAuthHost:  OAuthHost,
 		ClientID:   ClientID,
+		Function:   Function,
 	}
 }
 
 func (c *Client) agentBase() string { return c.AgentHost }
+
+// function 返回生效的 function 通道名（未设置时回落默认常量）。
+func (c *Client) function() string {
+	if f := strings.TrimSpace(c.Function); f != "" {
+		return f
+	}
+	return Function
+}
+
 func (c *Client) ugBase() string    { return c.UgHost }
 func (c *Client) oauthBase() string { return c.OAuthHost }
+
+// doJSONLimit 响应体上限。solo_agent 的 get_detail_param 实测 1.44MB（48 配置时
+// 从未踩到旧 1MB 上限），静默截断会让 JSON 解析报「unexpected end of JSON input」
+// 这种看起来像上游炸了的错，故直接放到 8MB（与请求体 maxBodyBytes 同量级）。
+const doJSONLimit = 8 << 20
 
 // doJSON 发请求并解 JSON；HTTP 非 2xx 时返回带 body 片段的 *Error。
 func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
@@ -166,7 +184,7 @@ func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, doJSONLimit))
 	if resp.StatusCode >= 400 {
 		kind := Classify(resp.StatusCode, string(raw))
 		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
@@ -269,7 +287,7 @@ func (c *Client) ChatStream(ctx context.Context, a *auth.Auth, body []byte) (rc 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.agentBase()+EpChat, bytes.NewReader(PrepareBody(body)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.agentBase()+EpChat, bytes.NewReader(PrepareBodyFunction(body, c.function())))
 	if err != nil {
 		return nil, 0, nil, err
 	}
@@ -303,12 +321,20 @@ type ModelInfo struct {
 	PromptMaxTokens int64   // = model_detail_list.prompt_max_tokens（最大输入）
 	MaxTokens       int64   // = model_detail_list.max_tokens（最大输出）
 	Rate            float64 // 上游消耗倍率（consumption_rate），0 = 未知
+	// Invisible = 上游 is_invisible_to_user：只影响 /v1/models 展示，不影响路由。
+	// 实测部分 invisible 配置（如 kimi-k2.6）直接请求仍能正常返回，
+	// 因此不能把它们在 mapModel 门口一并拒掉。
+	Invisible bool
 }
 
-// FetchModels 拉 SOLO 模型表（get_detail_param，32 配置）。
+// FetchModels 拉 SOLO 模型表（get_detail_param）。
+//
+// 返回全量配置（含 is_invisible_to_user=true 的内部配置），由调用方决定展示口径：
+// solo_agent 通道会额外返回 title_generation / summary / *_auto / 各类 sub_agent
+// 等配置（实测 28/69 条），列进 /v1/models 只会污染客户端的模型选择器。
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	body := map[string]any{
-		"function":            Function,
+		"function":            c.function(),
 		"config_names":        nil,
 		"need_prompt":         false,
 		"current_config_info": nil,
@@ -329,6 +355,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	var resp struct {
 		ConfigInfoList []struct {
 			ConfigName    string `json:"config_name"`
+			IsInvisible   bool   `json:"is_invisible_to_user"`
 			DisplayConfig struct {
 				DisplayName string `json:"display_name"`
 			} `json:"display_config"`
@@ -352,24 +379,45 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		if cfg.ConfigName == "" {
 			continue
 		}
-		var promptMax, maxOut int64
-		if len(cfg.ModelDetailList) > 0 {
-			promptMax = cfg.ModelDetailList[0].PromptMaxTokens
-			maxOut = cfg.ModelDetailList[0].MaxTokens
+		// 多档模型（solo_agent 的 __dev/__max 双档）取容量最大的一档：
+		// 实测裸 config_name 请求即可吃下 max 档（930K 输入通过），
+		// 报 dev 档会把可用能力低估一半。
+		promptMax, maxOut := maxTierLimits(cfg.ModelDetailList)
+		// 窗口至少要等于所选档的输入上限：少数模型 context_window_tokens
+		// 只写了 dev 值，直接取 max 会低估。
+		window := contextWindowTokens(cfg.ContextWindowTokens, promptMax)
+		if promptMax > window {
+			window = promptMax + maxOut
 		}
 		out = append(out, ModelInfo{
 			ID:              cfg.ConfigName,
 			Name:            cfg.DisplayConfig.DisplayName,
-			ContextWindow:   contextWindowTokens(cfg.ContextWindowTokens, promptMax),
+			ContextWindow:   window,
 			PromptMaxTokens: promptMax,
 			MaxTokens:       maxOut,
 			Rate:            consumptionRate(cfg.DisplayContactConfig),
+			Invisible:       cfg.IsInvisible,
 		})
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
 	return out, nil
+}
+
+// maxTierLimits 从 model_detail_list 里取输入上限最大的那一档，
+// 返回该档的 (prompt_max_tokens, max_tokens)。空列表返回 (0,0)。
+func maxTierLimits(details []struct {
+	ModelName       string `json:"model_name"`
+	PromptMaxTokens int64  `json:"prompt_max_tokens"`
+	MaxTokens       int64  `json:"max_tokens"`
+}) (promptMax, maxOut int64) {
+	for _, d := range details {
+		if d.PromptMaxTokens > promptMax {
+			promptMax, maxOut = d.PromptMaxTokens, d.MaxTokens
+		}
+	}
+	return promptMax, maxOut
 }
 
 // contextWindowTokens 取模型真实上下文窗口。

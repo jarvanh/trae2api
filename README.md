@@ -155,11 +155,25 @@ curl -X POST http://127.0.0.1:7864/v1/chat/completions \
 | `TW2A_DEFAULT_MODEL` | `glm-5.2` | 默认回退请求模型 |
 | `TW2A_CALLBACK_PORT` | `18080` | 本地 OAuth 回调端口（设为 0 可关闭） |
 | `TW2A_TIMEOUT_SECONDS` | `120` | 上游请求超时时长（秒） |
+| `TW2A_FUNCTION` | `solo_agent` | 上游 function 通道；填 `solo_work_lite` 可回滚旧免费通道（无 max 档，上下文上限 200K） |
 | `TW2A_REFRESH_SKEW` | `72h` | token 预刷新窗口：到期前多久开始自动续期（config.json 键 `schedule.refresh_skew`） |
 | `TW2A_ERR_THRESHOLD` | `3` | 触发冷却前的连续错误次数 |
 | `TW2A_ERR_COOLDOWN` | `10m` | 错误冷却时长（duration 字符串，如 `10m` / `600s`） |
 
 > 注：`upstream.keepalive_seconds`（流式首帧前的 SSE 心跳间隔，未设/0 = 默认 15s，负数 = 关闭）仅支持 `config.json` 配置，无对应环境变量。
+
+### 上游 function 通道（`upstream.function`）
+
+实测（2026-10-26）不同 function 返回的模型能力差别很大：
+
+| function | 可见配置数 | `glm-5.3` 能力 | 说明 |
+|---|---|---|---|
+| `solo_agent`（默认） | 69（41 可见） | **1M / 936K 输入 / 64K 输出** | 带 `__dev`/`__max` 双档，裸 `config_name` 即可命中 max 档 |
+| `solo_work_lite` | 48 | 200K / 168K 输入 / 32K 输出 | 免费引流通道，无 max 档 |
+| `chat_v3` | 59 | dev 档仅 116K | IDE 对话通道 |
+
+`/v1/models` 只列 `is_invisible_to_user=false` 的面向用户配置；invisible 的内部配置
+（`*_auto` / `*_subagent` / `title_generation` 等）仍可直接请求（实测部分可用），不参与展示。
 
 ## 安全声明
 

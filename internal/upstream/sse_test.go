@@ -7,6 +7,22 @@ import (
 	"testing"
 )
 
+func TestPrepareBodyFunctionExplicitOverride(t *testing.T) {
+	out := PrepareBodyFunction([]byte(`{"model":"glm-5.3","messages":[{"role":"user","content":"hi"}]}`), FunctionWorkLite)
+	var m map[string]any
+	json.Unmarshal(out, &m)
+	if m["function"] != "solo_work_lite" {
+		t.Errorf("function=%v want solo_work_lite", m["function"])
+	}
+	// 空值回落默认常量，不写空字符串进上游
+	out2 := PrepareBodyFunction([]byte(`{"model":"glm-5.3","messages":[]}`), "")
+	var m2 map[string]any
+	json.Unmarshal(out2, &m2)
+	if m2["function"] != Function {
+		t.Errorf("empty function should fall back: got %v want %v", m2["function"], Function)
+	}
+}
+
 func TestPrepareBodyForcesStreamAndFunction(t *testing.T) {
 	out := PrepareBody([]byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
 	var m map[string]any
@@ -14,8 +30,8 @@ func TestPrepareBodyForcesStreamAndFunction(t *testing.T) {
 	if m["stream"] != true {
 		t.Errorf("stream=%v", m["stream"])
 	}
-	if m["function"] != "solo_work_lite" {
-		t.Errorf("function=%v", m["function"])
+	if m["function"] != Function {
+		t.Errorf("function=%v want %v", m["function"], Function)
 	}
 	if m["config_name"] != "glm-5.2" || m["model"] != "glm-5.2" {
 		t.Errorf("model fields=%v / %v", m["config_name"], m["model"])

@@ -163,6 +163,8 @@ func (h *Handler) adminModels(w http.ResponseWriter, r *http.Request) {
 		ID              string  `json:"id"`
 		ContextLength   int64   `json:"context_length,omitempty"`
 		ConsumptionRate float64 `json:"consumption_rate"`
+		// invisible 由上游 is_invisible_to_user 直接带出（json:"-"：仅供本地过滤，不进 API）。
+		invisible bool
 	}
 	// 默认排序：倍率升序（省的在最上），**倍率未知(0)恒定沉底**，并列按 ID 升序。
 	// 未知必须沉底：上游有相当一部分模型不返回 consumption_rate，
@@ -182,8 +184,9 @@ func (h *Handler) adminModels(w http.ResponseWriter, r *http.Request) {
 			return items[i].ID < items[j].ID
 		})
 	}
-	// 默认隐藏上游返回的内部/占位模型（custom_model_*、*_subagent/*_agent、summary），
-	// 加 ?all=1 可看全量。上游没有标识字段，只能按命名模式识别。
+	// 默认隐藏上游内部配置：is_invisible_to_user=true 优先（实测 solo_agent 下 28/69 条），
+	// 再加命名启发式盖住上游标为可见但实为占位/内部的 custom_model_* 等。
+	// 加 ?all=1 可看全量。
 	showAll := r.URL.Query().Get("all") == "1"
 	hidden := 0
 	dynamic := false
@@ -193,7 +196,7 @@ func (h *Handler) adminModels(w http.ResponseWriter, r *http.Request) {
 		if !showAll {
 			kept := items[:0]
 			for _, it := range items {
-				if isInternalModel(it.ID) {
+				if it.invisible || isInternalModel(it.ID) {
 					hidden++
 					continue
 				}
@@ -225,7 +228,7 @@ func (h *Handler) adminModels(w http.ResponseWriter, r *http.Request) {
 		dynamic = true
 		items := make([]modelItem, 0, len(infos))
 		for _, mi := range infos {
-			item := modelItem{ID: mi.ID, ConsumptionRate: mi.Rate}
+			item := modelItem{ID: mi.ID, ConsumptionRate: mi.Rate, invisible: mi.Invisible}
 			if cl, ok := modelContextLength(mi); ok {
 				item.ContextLength = cl
 			}
@@ -245,11 +248,13 @@ func (h *Handler) adminModels(w http.ResponseWriter, r *http.Request) {
 
 // isInternalModel 判定上游返回的「内部 / 占位」模型（控制台默认隐藏）。
 //
-// 上游 get_detail_param 会把内部子代理、自定义占位配置一并放在 config_info_list
-// 里返回，且**没有任何标识字段**区分它们 —— 只能按命名模式识别：
+// 上游 get_detail_param 现会把 is_invisible_to_user 随配置一并返回（动态路径直接
+// 用该标志，见 adminModels）；但仍有相当一部分内部/占位配置被上游标为「可见」：
 //   - custom_model_*  ：占位/自定义配置（实测 14 个）
 //   - *_subagent/*_agent：内部子代理（browser_use / computer_use / explore / file_search）
-//   - summary         ：内部摘要功能
+//   - summary / title_generation / input_optimization：IDE 内部功能位
+//
+// 因此命名启发式作为标志之外的补集，不能删。
 //
 // 注意：aquila / sagitta / claude-opus-5 等虽倍率为 0 或有内部色彩，
 // 但命名像真实可用模型，保守保留，不过滤。
@@ -264,7 +269,11 @@ func isInternalModel(id string) bool {
 	if strings.Contains(id, "_subagent") || strings.Contains(id, "_agent") {
 		return true
 	}
-	return id == "summary"
+	switch id {
+	case "summary", "title_generation", "input_optimization":
+		return true
+	}
+	return false
 }
 
 // uiOrder 控制台自定义顺序（拖动排序后保存）：键为列表名，值为 uid / 模型 ID 序列。

@@ -9,16 +9,22 @@ import (
 // PrepareBody 单 pass 改写；无法解析时原样返回。
 //
 //	OpenAI: {model, messages, stream, tools, tool_choice, ...}
-//	SOLO:   {messages, function:"solo_work_lite", stream:true,
+//	SOLO:   {messages, function:<Function>, stream:true,
 //	         config_name:<model>, model:<model>}
 //
 // 改写规则（SPEC §4.4）：
 //  1. messages: content 字符串 → [{"type":"text","text":...}]；已是数组 → 透传
 //  2. stream: 强制 true（非流式由服务端聚合）
 //  3. model → config_name + model
-//  4. function: 固定 "solo_work_lite"
+//  4. function: 默认常量 Function（可被 Client.Function 覆盖）
 //  5. tools/tool_choice: 归一化（"none" 删 tools；auto/required 保留；function 提取 name）
 func PrepareBody(src []byte) []byte {
+	return PrepareBodyFunction(src, Function)
+}
+
+// PrepareBodyFunction 同 PrepareBody，但显式指定上游 function
+// （solo_agent 有 max 档 = 1M 窗口；solo_work_lite 只有 200K）。
+func PrepareBodyFunction(src []byte, function string) []byte {
 	if len(src) == 0 {
 		return src
 	}
@@ -27,7 +33,10 @@ func PrepareBody(src []byte) []byte {
 		return src
 	}
 	obj["stream"] = true
-	obj["function"] = Function
+	if strings.TrimSpace(function) == "" {
+		function = Function
+	}
+	obj["function"] = function
 
 	if msgs, ok := obj["messages"].([]any); ok {
 		for _, mi := range msgs {

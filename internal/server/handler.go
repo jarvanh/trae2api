@@ -244,9 +244,21 @@ func normalizeModelName(s string) string {
 	return strings.Join(parts, "-")
 }
 
-// knownModel 判断 model 是否在动态/静态模型表中。
+// knownModel 判断 model 是否是上游已知的 config_name。
+//
+// 口径故意比 /v1/models 宽：动态表里的 invisible 配置（如 kimi-k2.6）实测
+// 仍可正常请求，只是不该出现在模型列表里污染客户端选择器；若在此一并拒掉，
+// 切换 function 通道后这些 id 会凭空 400。动态表为空时回退静态表。
 func (h *Handler) knownModel(model string) bool {
-	for _, m := range h.modelList() {
+	if infos := h.fetchDynamicModels(); len(infos) > 0 {
+		for _, mi := range infos {
+			if mi.ID == model {
+				return true
+			}
+		}
+		return false
+	}
+	for _, m := range staticModels {
 		if m["id"] == model {
 			return true
 		}
@@ -254,41 +266,50 @@ func (h *Handler) knownModel(model string) bool {
 	return false
 }
 
-// 静态 SOLO 模型表（SPEC P3：32 个 config_name，来自逆向报告；动态拉取失败时回退）。
+// 静态 SOLO 模型表（动态拉取失败时回退，41 个 config_name 对齐 solo_agent 通道实测可见集）。
 // 不含 context_length：上游不可用时宁可不声明，也不伪造统一窗口值。
 var staticModels = []map[string]any{
 	{"id": "DeepSeek-V4-Flash-Official", "object": "model", "created": 1753600000, "owned_by": "trae-work"},
 	{"id": "Doubao-Seed-2.1-Pro", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
-	{"id": "seed-code-pro-0430", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
 	{"id": "Doubao-Seed-2.1-Turbo", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
-	{"id": "Doubao-Seed-2.0-Code", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
-	{"id": "browser_use_subagent", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
 	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
-	{"id": "glm-5-turbo", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
-	{"id": "glm-5", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
-	{"id": "DeepSeek-V4-Pro", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
-	{"id": "DeepSeek-V4-Flash", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
 	{"id": "kimi-k3", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
-	{"id": "kimi-k2.7-code", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
-	{"id": "kimi-k2.6", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
 	{"id": "minimax-m3", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
 	{"id": "qwen-3.7-plus", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
-	{"id": "sagitta", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
-	{"id": "aquila", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
 	{"id": "custom_model_gemini", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
 	{"id": "custom_model_placeholder", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
 	{"id": "custom_model_1M_text", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
 	{"id": "custom_model_1M", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
 	{"id": "custom_model_kimi", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
-	{"id": "custom_model_claude", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
 	{"id": "custom_model_gpt-5", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
 	{"id": "custom_model_no-fc", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
 	{"id": "custom_model_deepseek_chat", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
 	{"id": "custom_model_deepseek_reasoner", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
 	{"id": "custom_model_deepseek_v4", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
-	{"id": "explore_sub_agent_v13", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
-	{"id": "explore_sub_agent_v2", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
 	{"id": "summary", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
+	{"id": "DeepSeek-V4-Pro-Official", "object": "model", "created": 1753600000, "owned_by": "trae-work"},
+	{"id": "Doubao-Seed-Code", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
+	{"id": "Doubao-Seed-Evolving", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
+	{"id": "claude-opus-5", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
+	{"id": "custom_model_200k", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
+	{"id": "custom_model_200k_text", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
+	{"id": "custom_model_doubao_1M", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
+	{"id": "custom_model_doubao_256k", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
+	{"id": "custom_model_gpt-6", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
+	{"id": "deepseek-v4.1-flash", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
+	{"id": "glm-5.3", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
+	{"id": "glm-5.3-flash", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
+	{"id": "glm-5.3-flashx", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
+	{"id": "input_optimization", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
+	{"id": "kimi-k2.8-preview", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
+	{"id": "kimi-k3.1-pro", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
+	{"id": "mimo-v2.6-flash", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
+	{"id": "mimo-v2.6-pro", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
+	{"id": "minimax-m3.1-flash", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
+	{"id": "qwen3.8-flash", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
+	{"id": "qwen3.8-max", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
+	{"id": "step-5-preview", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
+	{"id": "title_generation", "object": "model", "created": 1753600000, "owned_by": "trae-solo"},
 }
 
 // dynamicModelsCache 动态模型缓存（成功 1h / 失败负缓存 5min）。
@@ -312,10 +333,16 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 }
 
 // modelList 动态获取模型列表并包装成 OpenAI 格式；失败回退静态表。
+//
+// 只列面向用户的配置：invisible 的内部配置（*_auto / sub_agent / title_generation
+// 等）不展示，但仍可被 knownModel 路由（见其注释）。
 func (h *Handler) modelList() []map[string]any {
 	if infos := h.fetchDynamicModels(); len(infos) > 0 {
 		out := make([]map[string]any, 0, len(infos))
 		for _, mi := range infos {
+			if mi.Invisible {
+				continue
+			}
 			entry := map[string]any{
 				"id":       mi.ID,
 				"object":   "model",

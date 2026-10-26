@@ -236,8 +236,12 @@ func TestModelsEndpoint(t *testing.T) {
 		t.Errorf("object=%v", resp["object"])
 	}
 	data := resp["data"].([]any)
-	if len(data) != 32 {
-		t.Errorf("models count=%d want 32", len(data))
+	// 动态拉取在单测里必失败（无真实上游），走的是 staticModels 回退表。
+	if len(data) != len(staticModels) {
+		t.Errorf("models count=%d want %d", len(data), len(staticModels))
+	}
+	if len(data) == 0 {
+		t.Fatal("empty static fallback table")
 	}
 	found := false
 	for _, m := range data {
@@ -247,6 +251,13 @@ func TestModelsEndpoint(t *testing.T) {
 	}
 	if !found {
 		t.Error("glm-5.2 missing")
+	}
+	// 回退表不得声明 context_length：上游不可用时宁可不写，也不伪造窗口值。
+	for _, m := range data {
+		mm := m.(map[string]any)
+		if _, ok := mm["context_length"]; ok {
+			t.Errorf("static fallback %v must not declare context_length", mm["id"])
+		}
 	}
 }
 
