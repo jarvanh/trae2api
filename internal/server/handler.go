@@ -325,6 +325,12 @@ func (h *Handler) modelList() []map[string]any {
 			if cl, ok := modelContextLength(mi); ok {
 				entry["context_length"] = cl
 			}
+			if mi.PromptMaxTokens > 0 {
+				entry["max_input_tokens"] = mi.PromptMaxTokens
+			}
+			if mi.MaxTokens > 0 {
+				entry["max_output_tokens"] = mi.MaxTokens
+			}
 			if mi.Rate > 0 {
 				entry["consumption_rate"] = mi.Rate
 			}

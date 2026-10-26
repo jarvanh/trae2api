@@ -297,11 +297,12 @@ func (c *Client) ChatStream(ctx context.Context, a *auth.Auth, body []byte) (rc 
 
 // ModelInfo 动态模型信息。
 type ModelInfo struct {
-	ID            string
-	Name          string
-	ContextWindow int64   // = maxInputTokens
-	MaxTokens     int64   // = maxOutputTokens
-	Rate          float64 // 上游消耗倍率（consumption_rate），0 = 未知
+	ID              string
+	Name            string
+	ContextWindow   int64   // = context_window_tokens（总窗口）
+	PromptMaxTokens int64   // = model_detail_list.prompt_max_tokens（最大输入）
+	MaxTokens       int64   // = model_detail_list.max_tokens（最大输出）
+	Rate            float64 // 上游消耗倍率（consumption_rate），0 = 未知
 }
 
 // FetchModels 拉 SOLO 模型表（get_detail_param，32 配置）。
@@ -357,11 +358,12 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			maxOut = cfg.ModelDetailList[0].MaxTokens
 		}
 		out = append(out, ModelInfo{
-			ID:            cfg.ConfigName,
-			Name:          cfg.DisplayConfig.DisplayName,
-			ContextWindow: contextWindowTokens(cfg.ContextWindowTokens, promptMax),
-			MaxTokens:     maxOut,
-			Rate:          consumptionRate(cfg.DisplayContactConfig),
+			ID:              cfg.ConfigName,
+			Name:            cfg.DisplayConfig.DisplayName,
+			ContextWindow:   contextWindowTokens(cfg.ContextWindowTokens, promptMax),
+			PromptMaxTokens: promptMax,
+			MaxTokens:       maxOut,
+			Rate:            consumptionRate(cfg.DisplayContactConfig),
 		})
 	}
 	if len(out) == 0 {

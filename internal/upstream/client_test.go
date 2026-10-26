@@ -114,11 +114,12 @@ func TestFetchModelsParsesContextWindow(t *testing.T) {
 	cases := []struct {
 		id          string
 		contextWant int64
+		inputWant   int64
 		maxWant     int64
 	}{
-		{"m1", 256000, 32000},
-		{"m2", 1000000, 128000}, // context_window_tokens 为空 → prompt_max_tokens
-		{"m3", 184000, 16000},   // 多环境键取最大值
+		{"m1", 256000, 224000, 32000},
+		{"m2", 1000000, 1000000, 128000}, // context_window_tokens 为空 → prompt_max_tokens
+		{"m3", 184000, 168000, 16000},    // 多环境键取最大值
 	}
 	for _, c := range cases {
 		mi, ok := byID[c.id]
@@ -127,6 +128,9 @@ func TestFetchModelsParsesContextWindow(t *testing.T) {
 		}
 		if mi.ContextWindow != c.contextWant {
 			t.Errorf("%s context=%d want %d", c.id, mi.ContextWindow, c.contextWant)
+		}
+		if mi.PromptMaxTokens != c.inputWant {
+			t.Errorf("%s input=%d want %d", c.id, mi.PromptMaxTokens, c.inputWant)
 		}
 		if mi.MaxTokens != c.maxWant {
 			t.Errorf("%s max=%d want %d", c.id, mi.MaxTokens, c.maxWant)

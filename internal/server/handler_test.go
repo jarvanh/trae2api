@@ -254,7 +254,7 @@ func TestModelListDynamicContextLength(t *testing.T) {
 	dynamicModelsCache.Lock()
 	oldIDs, oldFetched, oldFail := dynamicModelsCache.ids, dynamicModelsCache.fetched, dynamicModelsCache.lastFail
 	dynamicModelsCache.ids = []upstream.ModelInfo{
-		{ID: "real", ContextWindow: 256000},
+		{ID: "real", ContextWindow: 256000, PromptMaxTokens: 224000, MaxTokens: 32000},
 		{ID: "unknown", ContextWindow: 0},
 	}
 	dynamicModelsCache.fetched = time.Now()
@@ -275,6 +275,12 @@ func TestModelListDynamicContextLength(t *testing.T) {
 	}
 	if got := byID["real"]["context_length"]; got != int64(256000) {
 		t.Errorf("real context=%v want 256000", got)
+	}
+	if got := byID["real"]["max_input_tokens"]; got != int64(224000) {
+		t.Errorf("real max_input=%v want 224000", got)
+	}
+	if got := byID["real"]["max_output_tokens"]; got != int64(32000) {
+		t.Errorf("real max_output=%v want 32000", got)
 	}
 	if got, ok := byID["unknown"]["context_length"]; ok {
 		t.Errorf("unknown context should be omitted, got %v", got)
