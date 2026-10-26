@@ -161,7 +161,7 @@ func (h *Handler) adminCredits(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) adminModels(w http.ResponseWriter, r *http.Request) {
 	type modelItem struct {
 		ID              string  `json:"id"`
-		ContextLength   int64   `json:"context_length"`
+		ContextLength   int64   `json:"context_length,omitempty"`
 		ConsumptionRate float64 `json:"consumption_rate"`
 	}
 	// 默认排序：倍率升序（省的在最上），**倍率未知(0)恒定沉底**，并列按 ID 升序。
@@ -225,11 +225,11 @@ func (h *Handler) adminModels(w http.ResponseWriter, r *http.Request) {
 		dynamic = true
 		items := make([]modelItem, 0, len(infos))
 		for _, mi := range infos {
-			items = append(items, modelItem{
-				ID:              mi.ID,
-				ContextLength:   modelContextLength(mi),
-				ConsumptionRate: mi.Rate,
-			})
+			item := modelItem{ID: mi.ID, ConsumptionRate: mi.Rate}
+			if cl, ok := modelContextLength(mi); ok {
+				item.ContextLength = cl
+			}
+			items = append(items, item)
 		}
 		emit(items, true)
 		return
@@ -238,8 +238,7 @@ func (h *Handler) adminModels(w http.ResponseWriter, r *http.Request) {
 	items := make([]modelItem, 0, len(staticModels))
 	for _, m := range staticModels {
 		id, _ := m["id"].(string)
-		cl, _ := m["context_length"].(int)
-		items = append(items, modelItem{ID: id, ContextLength: int64(cl), ConsumptionRate: 0})
+		items = append(items, modelItem{ID: id, ConsumptionRate: 0})
 	}
 	emit(items, dynamic)
 }

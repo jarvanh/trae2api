@@ -269,18 +269,15 @@ func TestModelListDynamicContextLength(t *testing.T) {
 	}()
 
 	h := NewHandler(Config{})
-	got := make(map[string]any)
+	byID := make(map[string]map[string]any)
 	for _, m := range h.modelList() {
-		got[m["id"].(string)] = m["context_length"]
+		byID[m["id"].(string)] = m
 	}
-	if got["real"] != int64(256000) {
-		t.Errorf("real context=%v want 256000", got["real"])
+	if got := byID["real"]["context_length"]; got != int64(256000) {
+		t.Errorf("real context=%v want 256000", got)
 	}
-	if got["unknown"] != fallbackContextLength {
-		t.Errorf("unknown context=%v want %d", got["unknown"], fallbackContextLength)
-	}
-	if got["unknown"] == int64(0) {
-		t.Error("unknown context must not be 0")
+	if got, ok := byID["unknown"]["context_length"]; ok {
+		t.Errorf("unknown context should be omitted, got %v", got)
 	}
 }
 
