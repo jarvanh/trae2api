@@ -320,10 +320,7 @@ func (h *Handler) modelList() []map[string]any {
 				"object":         "model",
 				"created":        1753600000,
 				"owned_by":       "trae-solo",
-				"context_length": mi.ContextWindow,
-			}
-			if entry["context_length"] == 0 {
-				entry["context_length"] = 131072
+				"context_length": modelContextLength(mi),
 			}
 			if mi.Rate > 0 {
 				entry["consumption_rate"] = mi.Rate

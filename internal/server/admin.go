@@ -225,11 +225,11 @@ func (h *Handler) adminModels(w http.ResponseWriter, r *http.Request) {
 		dynamic = true
 		items := make([]modelItem, 0, len(infos))
 		for _, mi := range infos {
-			cl := mi.ContextWindow
-			if cl == 0 {
-				cl = 131072
-			}
-			items = append(items, modelItem{ID: mi.ID, ContextLength: cl, ConsumptionRate: mi.Rate})
+			items = append(items, modelItem{
+				ID:              mi.ID,
+				ContextLength:   modelContextLength(mi),
+				ConsumptionRate: mi.Rate,
+			})
 		}
 		emit(items, true)
 		return

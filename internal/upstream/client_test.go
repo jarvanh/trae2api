@@ -86,6 +86,54 @@ func TestRefreshTokenExchange(t *testing.T) {
 	}
 }
 
+func TestFetchModelsParsesContextWindow(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if !strings.HasSuffix(r.URL.Path, EpModels) {
+			return nil, errors.New("wrong path: " + r.URL.Path)
+		}
+		return jsonResp(200, `{"config_info_list":[
+			{"config_name":"m1","display_config":{"display_name":"M1"},
+			 "context_window_tokens":{"dev":256000},
+			 "model_detail_list":[{"model_name":"x","prompt_max_tokens":224000,"max_tokens":32000}]},
+			{"config_name":"m2",
+			 "context_window_tokens":{},
+			 "model_detail_list":[{"model_name":"y","prompt_max_tokens":1000000,"max_tokens":128000}]},
+			{"config_name":"m3",
+			 "context_window_tokens":{"dev":184000,"max":184000},
+			 "model_detail_list":[{"model_name":"z","prompt_max_tokens":168000,"max_tokens":16000}]}
+		]}`), nil
+	})
+	infos, err := c.FetchModels(&auth.Auth{AccessToken: "at"})
+	if err != nil {
+		t.Fatalf("fetch models: %v", err)
+	}
+	byID := make(map[string]ModelInfo, len(infos))
+	for _, mi := range infos {
+		byID[mi.ID] = mi
+	}
+	cases := []struct {
+		id          string
+		contextWant int64
+		maxWant     int64
+	}{
+		{"m1", 256000, 32000},
+		{"m2", 1000000, 128000}, // context_window_tokens 为空 → prompt_max_tokens
+		{"m3", 184000, 16000},   // 多环境键取最大值
+	}
+	for _, c := range cases {
+		mi, ok := byID[c.id]
+		if !ok {
+			t.Fatalf("missing model %s", c.id)
+		}
+		if mi.ContextWindow != c.contextWant {
+			t.Errorf("%s context=%d want %d", c.id, mi.ContextWindow, c.contextWant)
+		}
+		if mi.MaxTokens != c.maxWant {
+			t.Errorf("%s max=%d want %d", c.id, mi.MaxTokens, c.maxWant)
+		}
+	}
+}
+
 // TestRefreshTokenExchangeMilliseconds 覆盖上游 TokenExpireAt 返回毫秒的场景：
 // 必须归一化为 Unix 秒后再写 auth.ExpiresAt。
 func TestRefreshTokenExchangeMilliseconds(t *testing.T) {

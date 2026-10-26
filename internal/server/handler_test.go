@@ -250,6 +250,40 @@ func TestModelsEndpoint(t *testing.T) {
 	}
 }
 
+func TestModelListDynamicContextLength(t *testing.T) {
+	dynamicModelsCache.Lock()
+	oldIDs, oldFetched, oldFail := dynamicModelsCache.ids, dynamicModelsCache.fetched, dynamicModelsCache.lastFail
+	dynamicModelsCache.ids = []upstream.ModelInfo{
+		{ID: "real", ContextWindow: 256000},
+		{ID: "unknown", ContextWindow: 0},
+	}
+	dynamicModelsCache.fetched = time.Now()
+	dynamicModelsCache.lastFail = time.Time{}
+	dynamicModelsCache.Unlock()
+	defer func() {
+		dynamicModelsCache.Lock()
+		dynamicModelsCache.ids = oldIDs
+		dynamicModelsCache.fetched = oldFetched
+		dynamicModelsCache.lastFail = oldFail
+		dynamicModelsCache.Unlock()
+	}()
+
+	h := NewHandler(Config{})
+	got := make(map[string]any)
+	for _, m := range h.modelList() {
+		got[m["id"].(string)] = m["context_length"]
+	}
+	if got["real"] != int64(256000) {
+		t.Errorf("real context=%v want 256000", got["real"])
+	}
+	if got["unknown"] != fallbackContextLength {
+		t.Errorf("unknown context=%v want %d", got["unknown"], fallbackContextLength)
+	}
+	if got["unknown"] == int64(0) {
+		t.Error("unknown context must not be 0")
+	}
+}
+
 func TestAPIKeyAuth(t *testing.T) {
 	h := NewHandler(Config{
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),

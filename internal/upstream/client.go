@@ -331,10 +331,15 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			DisplayConfig struct {
 				DisplayName string `json:"display_name"`
 			} `json:"display_config"`
+			// 上下文窗口按运行环境映射（实测 {"dev":256000} 或 {"dev":184000,"max":184000}）。
+			// 少数模型（pro/flash/free）该字段为空，回退 model_detail_list.prompt_max_tokens。
+			ContextWindowTokens map[string]float64 `json:"context_window_tokens"`
 			// 内嵌 JSON 字符串：consumption_rate.data.rate 即客户端显示的模型倍率（如 0.48x）
 			DisplayContactConfig string `json:"display_contact_config"`
 			ModelDetailList      []struct {
-				ModelName string `json:"model_name"`
+				ModelName       string `json:"model_name"`
+				PromptMaxTokens int64  `json:"prompt_max_tokens"`
+				MaxTokens       int64  `json:"max_tokens"`
 			} `json:"model_detail_list"`
 		} `json:"config_info_list"`
 	}
@@ -346,16 +351,41 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		if cfg.ConfigName == "" {
 			continue
 		}
+		var promptMax, maxOut int64
+		if len(cfg.ModelDetailList) > 0 {
+			promptMax = cfg.ModelDetailList[0].PromptMaxTokens
+			maxOut = cfg.ModelDetailList[0].MaxTokens
+		}
 		out = append(out, ModelInfo{
-			ID:   cfg.ConfigName,
-			Name: cfg.DisplayConfig.DisplayName,
-			Rate: consumptionRate(cfg.DisplayContactConfig),
+			ID:            cfg.ConfigName,
+			Name:          cfg.DisplayConfig.DisplayName,
+			ContextWindow: contextWindowTokens(cfg.ContextWindowTokens, promptMax),
+			MaxTokens:     maxOut,
+			Rate:          consumptionRate(cfg.DisplayContactConfig),
 		})
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
 	return out, nil
+}
+
+// contextWindowTokens 取模型真实上下文窗口。
+//
+// 上游 context_window_tokens 是环境映射（dev/max 等），正常只有一个键；
+// 多键时取最大值，避免不同环境口径不一致。映射为空（实测 pro/flash/free）
+// 时回退 prompt_max_tokens —— 这类模型的输入上限即窗口上限。
+func contextWindowTokens(m map[string]float64, promptMax int64) int64 {
+	var out int64
+	for _, v := range m {
+		if n := int64(v); n > out {
+			out = n
+		}
+	}
+	if out == 0 {
+		out = promptMax
+	}
+	return out
 }
 
 // consumptionRate 从 display_contact_config 内嵌 JSON 提取 consumption_rate.data.rate。
