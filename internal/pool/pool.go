@@ -328,7 +328,7 @@ func servesLocked(e *entry, model string, now time.Time) bool {
 
 // ModelKnown 判断 model 是否被至少一个账号的能力集覆盖（不看健康度）。
 //
-// 调用方用它决定「要不要开能力过滤」：并集表里查不到的名字（Work 透传模型、
+// 调用方用它决定「要不要开能力过滤」：所有账号都没报告过的名字（Work 透传模型、
 // 或能力数据还没探到）必须回退成「不限制」。能力过滤是优化，不是闸门 ——
 // 拿缺失的数据去拒请求，会把本来能跑通的调用打死。
 func (p *Pool) ModelKnown(model string) bool {

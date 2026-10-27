@@ -337,7 +337,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 }
 
 // FetchModelsCtx 同 FetchModels，但受 ctx 约束。
-// 跨账号取模型并集时用它给每个账号单独设超时 —— 否则一个卡住的账号会把
+// 跨账号拉模型目录时用它给每个账号单独设超时 —— 否则一个卡住的账号会把
 // 整轮刷新拖到 HTTP 客户端的全局超时（实测上游偶发挂住），拖坏 /v1/models。
 func (c *Client) FetchModelsCtx(ctx context.Context, a *auth.Auth) ([]ModelInfo, error) {
 	body := map[string]any{

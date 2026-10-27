@@ -893,10 +893,11 @@ func modelsJSON(ids ...string) string {
 	return b.String()
 }
 
-// TestFetchModelsUnionAcrossAccounts 覆盖 2026-10-27 修复：solo_agent 的模型集
-// 按账号漂移（free 只在一个号上）。只问一个号会让 /v1/models 间歇性漏模型，
-// 必须取跨账号并集，并把每号能力写回 pool 供选号过滤。
-func TestFetchModelsUnionAcrossAccounts(t *testing.T) {
+// TestFetchModelsIntersectionAcrossAccounts 覆盖 2026-10-27 主人定稿：模型目录取
+// 跨账号交集 —— 列表是「任何健康账号都能接」的承诺，并集会把只属于个别账号的
+// 模型挂出去（实测 free/pro/flash 对话上游 4001）。每号能力仍各自写回 pool，
+// 选号过滤按单号能力进行（交集只影响目录，不影响能力路由）。
+func TestFetchModelsIntersectionAcrossAccounts(t *testing.T) {
 	resetModelCache(t)
 	var calls int32
 	up := &upstream.Client{
@@ -931,16 +932,21 @@ func TestFetchModelsUnionAcrossAccounts(t *testing.T) {
 	for _, mi := range infos {
 		byID[mi.ID] = mi
 	}
-	// 并集：两号各自的独占模型都要在
-	for _, id := range []string{"glm-5.3", "free", "pro"} {
+	// 交集：只有两号都有的 glm-5.3 进目录；单号独占的 free/pro 不挂列表
+	for _, id := range []string{"glm-5.3"} {
 		if _, ok := byID[id]; !ok {
-			t.Errorf("并集缺少模型 %s（got %d 条）", id, len(infos))
+			t.Errorf("交集缺少模型 %s（got %d 条）", id, len(infos))
+		}
+	}
+	for _, id := range []string{"free", "pro"} {
+		if _, ok := byID[id]; ok {
+			t.Errorf("仅单号持有的 %s 不应出现在交集目录", id)
 		}
 	}
 	if n := atomic.LoadInt32(&calls); n != 2 {
 		t.Errorf("应按账号各拉一次，calls=%d", n)
 	}
-	// 能力集写回 pool：free 只有 u1 能接
+	// 每号能力仍写回 pool：free 只有 u1 能接，选号仍按单号能力过滤
 	if got := p.PickAffinityForModel("", nil, "free"); got == nil || got.UID != "u1" {
 		t.Errorf("选号未按能力过滤，got=%v want u1", got)
 	}

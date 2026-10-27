@@ -314,7 +314,7 @@ var staticModels = []map[string]any{
 
 // dynamicModelsCache 动态模型缓存（成功 1h / 失败负缓存 5min）。
 //
-// refreshing 是单飞标志：跨账号并集刷新要向池内每个账号各发一次
+// refreshing 是单飞标志：跨账号目录刷新要向池内每个账号各发一次
 // get_detail_param（实测单号响应 1.44MB），比旧的单号版贵 N 倍，
 // 绝不能被并发请求放大。
 var dynamicModelsCache struct {
@@ -329,10 +329,10 @@ const (
 	dynamicModelsTTL = time.Hour
 	// modelsFetchFailCooldown 全部账号都拉失败后的负缓存时长：这段时间内不再
 	// 扇出（否则每个 /v1/models 请求都打 N 次上游），也不再反复空刷。
-	// 取 30s（原 5min）：并集失败通常是短时抖动，5min 会让新上线的模型迟迟不出现。
+	// 取 30s（原 5min）：刷新失败通常是短时抖动，5min 会让新上线的模型迟迟不出现。
 	modelsFetchFailCooldown = 30 * time.Second
 	// modelsFetchPerAccountTimeout 单账号拉模型表的硬超时。不设的话一个挂死的
-	// 账号会把整轮并集刷新拖到 HTTP 客户端全局超时（实测上游偶发挂住）。
+	// 账号会把整轮目录刷新拖到 HTTP 客户端全局超时（实测上游偶发挂住）。
 	modelsFetchPerAccountTimeout = 25 * time.Second
 )
 
@@ -406,17 +406,17 @@ func (h *Handler) modelList() []map[string]any {
 	return out
 }
 
-// fetchDynamicModels 取跨账号并集的模型表，缓存 1h。
+// fetchDynamicModels 取跨账号交集的模型表，缓存 1h。
 //
-// 为什么不能只问一个号（旧行为）：solo_agent 的模型集按账号漂移 —— 实测 4 个
-// 账号分别返回 68/68/69/71 条，free/flash/pro/claude-opus-5 只在其中一个号上。
-// 只问一个号并缓存 1h，会让 /v1/models 列出「本轮那个号有、下轮换号就没」的
-// 模型，客户端间歇性 400/503。
+// 为什么跨号（旧行为只问一个号）：solo_agent 的模型集按账号漂移 —— 实测 4 个
+// 账号分别返回 68/68/69/71 条。为什么取交集而非并集（主人 2026-10-27 定稿）：
+// 列表是「任何健康账号都能接」的承诺，并集会把只属于个别账号的模型挂出去
+// （实测 free/pro/flash/claude-opus-5 对话层 4001）。
 //
 // 并发语义（stale-while-revalidate）：
 //   - 缓存新鲜 → 直接返回；
 //   - 过期但非空 → 立即返回旧数据，由后台 goroutine 单飞刷新（单飞标志保证
-//     同一时刻至多一轮跨号扇出），绝不阻塞请求。并集刷新要向每个号各发一次
+//     同一时刻至多一轮跨号扇出），绝不阻塞请求。目录刷新要向每个号各发一次
 //     get_detail_param（实测单号 1.44MB），同步做会把 TTL 边界上的那一个请求
 //     拖出可感知的延迟；
 //   - 无数据（冷启动/上轮全败）→ 同步刷新一次，宁可这一个请求慢，也不能
@@ -456,7 +456,7 @@ func (h *Handler) refreshModelCacheAsync() {
 	}
 }
 
-// refreshModelCacheOnce 单飞地执行一轮并集刷新。
+// refreshModelCacheOnce 单飞地执行一轮目录刷新。
 // 返回 (新表, 是否成功)。调用方不要并发扇出本函数 —— 单飞标志会合并并发请求。
 func (h *Handler) refreshModelCacheOnce() ([]upstream.ModelInfo, bool) {
 	dynamicModelsCache.Lock()
@@ -471,7 +471,7 @@ func (h *Handler) refreshModelCacheOnce() ([]upstream.ModelInfo, bool) {
 	dynamicModelsCache.refreshing = true
 	dynamicModelsCache.Unlock()
 
-	infos := h.refreshModelUnion()
+	infos := h.refreshModelIntersection()
 
 	dynamicModelsCache.Lock()
 	dynamicModelsCache.refreshing = false
@@ -487,9 +487,14 @@ func (h *Handler) refreshModelCacheOnce() ([]upstream.ModelInfo, bool) {
 	return out, len(infos) > 0
 }
 
-// refreshModelUnion 并发向全部健康账号拉模型表，取并集，并把每号能力集写回 pool
-// （选号过滤用，见 PickAffinityForModel）。返回 nil = 一个号都没成功。
-func (h *Handler) refreshModelUnion() []upstream.ModelInfo {
+// refreshModelIntersection 并发向全部健康账号拉模型表，取交集，并把每号能力集
+// 写回 pool（选号过滤用，见 PickAffinityForModel）。返回 nil = 一个号都没成功。
+//
+// 为什么是交集（主人 2026-10-27 定稿）：/v1/models 是对外承诺 —— 列出的模型必须
+// 「池里任何健康账号都能接」。并集会把只属于个别账号的模型挂上列表
+// （实测 free/pro/flash/claude-opus-5 → 对话上游 4001），交集下列表随健康号
+// 集合收缩；单号健康时退化为该号全集，这是交集的正确行为而非退化。
+func (h *Handler) refreshModelIntersection() []upstream.ModelInfo {
 	if h.cfg.Pool == nil || h.cfg.Upstream == nil {
 		return nil
 	}
@@ -521,31 +526,52 @@ func (h *Handler) refreshModelUnion() []upstream.ModelInfo {
 	}
 	wg.Wait()
 
-	// 并集：同 ID 各字段取跨号最大值（能力档随套餐浮动，取见过的最强档）；
-	// Invisible 收紧为「所有号都隐藏」——任一号可见即对外可见。
-	byID := make(map[string]upstream.ModelInfo, 256)
-	order := make([]string, 0, 256)
+	// 交集：以第一个成功结果为基准，只保留「每个成功结果都含」的 id。
+	// 容量字段取跨号最小值 —— 任意健康号都可能接到请求，按最弱承诺才不撒谎；
+	// 单号缺失（0）不参与取小，避免一份缺失元数据抹掉其他号的真实容量。
+	// Invisible 收紧为「任一号隐藏即隐藏」。
+	var base map[string]upstream.ModelInfo
+	var order []string
 	for _, p := range results {
 		if p == nil {
 			continue
 		}
+		base = make(map[string]upstream.ModelInfo, len(*p))
 		for _, mi := range *p {
 			if mi.ID == "" {
 				continue
 			}
-			cur, seen := byID[mi.ID]
-			if !seen {
-				byID[mi.ID] = mi
-				order = append(order, mi.ID)
+			base[mi.ID] = mi
+			order = append(order, mi.ID)
+		}
+		break
+	}
+	if base == nil {
+		return nil
+	}
+	for _, p := range results {
+		if p == nil {
+			continue
+		}
+		idx := make(map[string]upstream.ModelInfo, len(*p))
+		for _, mi := range *p {
+			if mi.ID != "" {
+				idx[mi.ID] = mi
+			}
+		}
+		for id, cur := range base {
+			mi, ok := idx[id]
+			if !ok {
+				delete(base, id)
 				continue
 			}
-			if mi.ContextWindow > cur.ContextWindow {
+			if mi.ContextWindow > 0 && (cur.ContextWindow == 0 || mi.ContextWindow < cur.ContextWindow) {
 				cur.ContextWindow = mi.ContextWindow
 			}
-			if mi.PromptMaxTokens > cur.PromptMaxTokens {
+			if mi.PromptMaxTokens > 0 && (cur.PromptMaxTokens == 0 || mi.PromptMaxTokens < cur.PromptMaxTokens) {
 				cur.PromptMaxTokens = mi.PromptMaxTokens
 			}
-			if mi.MaxTokens > cur.MaxTokens {
+			if mi.MaxTokens > 0 && (cur.MaxTokens == 0 || mi.MaxTokens < cur.MaxTokens) {
 				cur.MaxTokens = mi.MaxTokens
 			}
 			if cur.Name == "" {
@@ -554,16 +580,18 @@ func (h *Handler) refreshModelUnion() []upstream.ModelInfo {
 			if cur.Rate == 0 {
 				cur.Rate = mi.Rate
 			}
-			cur.Invisible = cur.Invisible && mi.Invisible
-			byID[mi.ID] = cur
+			cur.Invisible = cur.Invisible || mi.Invisible
+			base[id] = cur
 		}
 	}
-	if len(order) == 0 {
+	if len(base) == 0 {
 		return nil
 	}
 	out := make([]upstream.ModelInfo, 0, len(order))
 	for _, id := range order {
-		out = append(out, byID[id])
+		if mi, ok := base[id]; ok {
+			out = append(out, mi)
+		}
 	}
 	return out
 }
@@ -833,7 +861,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 能力过滤（2026-10-27）：solo_agent 的模型集按账号漂移（实测 4 号分别
-	// 68/68/69/71 条，free/flash/pro/claude-opus-5 只在一个号上）。并集刷新已把
+	// 68/68/69/71 条，free/flash/pro/claude-opus-5 只在一个号上）。能力刷新已把
 	// 每号能力写进 pool，这里据此只选真能承接该 config 的号 —— 否则模型列表
 	// 说有、轮到没这个号的账号就失败，等于把 400 换成了 503。
 	//
