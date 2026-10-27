@@ -333,6 +333,13 @@ type ModelInfo struct {
 // solo_agent 通道会额外返回 title_generation / summary / *_auto / 各类 sub_agent
 // 等配置（实测 28/69 条），列进 /v1/models 只会污染客户端的模型选择器。
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
+	return c.FetchModelsCtx(context.Background(), a)
+}
+
+// FetchModelsCtx 同 FetchModels，但受 ctx 约束。
+// 跨账号取模型并集时用它给每个账号单独设超时 —— 否则一个卡住的账号会把
+// 整轮刷新拖到 HTTP 客户端的全局超时（实测上游偶发挂住），拖坏 /v1/models。
+func (c *Client) FetchModelsCtx(ctx context.Context, a *auth.Auth) ([]ModelInfo, error) {
 	body := map[string]any{
 		"function":            c.function(),
 		"config_names":        nil,
@@ -343,7 +350,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		"agent_type":          nil,
 	}
 	raw, _ := json.Marshal(body)
-	req, err := http.NewRequest(http.MethodPost, c.agentBase()+EpModels, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.agentBase()+EpModels, bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}

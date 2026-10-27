@@ -97,6 +97,13 @@ type entry struct {
 	workUntil     time.Time
 	errCount      int
 	workErrCount  int
+	// models 该账号实测可见的 config_name 集合（数据源 get_detail_param）。
+	// nil = 尚未探测：选号时不做能力限制（宁可不限制，也不要凭空 503）。
+	// solo_agent 通道下模型集按账号不同（实测 4 号分别 68/68/69/71 条），
+	// 不做能力过滤会把只属于某账号的模型（free/flash/pro/claude-opus-5）
+	// 轮到没有它的账号上，变成间歇性失败。只存内存、不落 state.json：
+	// 每轮目录刷新重建，持久化反而会把已下线的模型钉死半天。
+	models map[string]bool
 
 	// 签到设备轮换代数与 9074 退避状态（持久化于 state.json，跨重启生效）。
 	// 代数只增不减：被风控标记的设备号一旦弃用就不再回头。
@@ -305,6 +312,75 @@ func (p *Pool) Pick() *auth.Auth {
 	return p.PickExcluding(nil)
 }
 
+// servesLocked 判断账号（持锁）在 now 时刻是否健康且有能力承接 model。
+//
+// model 为空 = 不限制；账号 models==nil = 尚未探测，按「可服务」处理。
+// 这条兜底很关键：能力数据缺失时宁可不限制，也不能让整池凭空 503。
+func servesLocked(e *entry, model string, now time.Time) bool {
+	if !e.healthy(now) {
+		return false
+	}
+	if model != "" && e.models != nil && !e.models[model] {
+		return false
+	}
+	return true
+}
+
+// ModelKnown 判断 model 是否被至少一个账号的能力集覆盖（不看健康度）。
+//
+// 调用方用它决定「要不要开能力过滤」：并集表里查不到的名字（Work 透传模型、
+// 或能力数据还没探到）必须回退成「不限制」。能力过滤是优化，不是闸门 ——
+// 拿缺失的数据去拒请求，会把本来能跑通的调用打死。
+func (p *Pool) ModelKnown(model string) bool {
+	if model == "" {
+		return false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, e := range p.byUID {
+		if e.models[model] {
+			return true
+		}
+	}
+	return false
+}
+
+// Healthy 返回当前健康账号快照（不含能力过滤），供模型目录跨账号刷新用。
+func (p *Pool) Healthy() []*auth.Auth {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	out := make([]*auth.Auth, 0, len(p.byUID))
+	for _, e := range p.byUID {
+		if e.healthy(now) && e.a != nil {
+			out = append(out, e.a)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].UID < out[j].UID })
+	return out
+}
+
+// SetModels 记录某账号实测可见的 config_name 集合（数据源 get_detail_param）。
+// 传空切片 = 清除能力信息（恢复「不限制」语义）。属运行态数据，不落 state.json：
+// 服务启动后首轮模型目录刷新即重建，持久化反而会把已下线的模型钉死半天。
+func (p *Pool) SetModels(uid string, ids []string) {
+	set := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if id != "" {
+			set[id] = true
+		}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		if len(set) == 0 { // 空集 = 清除，恢复「不限制」语义
+			e.models = nil
+		} else {
+			e.models = set
+		}
+	}
+}
+
 // expireKey 规则①的排序键：最早到期时间；未探测（0）视为无穷远排最后。
 func expireKey(e *entry) int64 {
 	if e.nearestExpire <= 0 {
@@ -340,15 +416,15 @@ func expirePressure(best, bound *entry) bool {
 }
 
 // bestByRuleLocked 按规则序返回最优健康账号（只读，不修改 lastUsed / 绑定）。
-// 与 PickExcluding 同口径，供临期压制判断使用。
-func (p *Pool) bestByRuleLocked(tried map[string]bool, now time.Time) *entry {
+// 与 PickExcluding 同口径，供临期压制判断使用。model 非空时叠加能力过滤。
+func (p *Pool) bestByRuleLocked(tried map[string]bool, now time.Time, model string) *entry {
 	var best *entry
 	var bestUID string
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
 			continue
 		}
-		if !e.healthy(now) {
+		if !servesLocked(e, model, now) {
 			continue
 		}
 		if best == nil || betterEntry(e, best, uid, bestUID) {
@@ -404,7 +480,9 @@ const minPickGap = 100 * time.Millisecond
 // pickBestCandidateLocked 综合健康检查、在途租约、规则序与防惊群窗口选号。
 // 排序口径与 PickExcluding 完全一致（betterEntry），保证两条选号路径行为统一；
 // 这里额外叠加在途租约筛选与 100ms 防惊群窗口（短名单内优先挑久未使用的）。
-func (p *Pool) pickBestCandidateLocked(tried map[string]bool, now time.Time) *entry {
+// pickBestCandidateLocked 综合健康检查、在途租约、规则序与防惊群窗口选号。
+// model 非空时只在能力匹配的账号里选（见 servesLocked）。
+func (p *Pool) pickBestCandidateLocked(tried map[string]bool, now time.Time, model string) *entry {
 	type uidEntry struct {
 		uid string
 		e   *entry
@@ -414,7 +492,7 @@ func (p *Pool) pickBestCandidateLocked(tried map[string]bool, now time.Time) *en
 		if tried != nil && tried[uid] {
 			continue
 		}
-		if !e.healthy(now) {
+		if !servesLocked(e, model, now) {
 			continue
 		}
 		ces = append(ces, uidEntry{uid: uid, e: e})
@@ -456,6 +534,16 @@ func (p *Pool) pickBestCandidateLocked(tried map[string]bool, now time.Time) *en
 // PickAffinity 优先按 sessionKey 会话粘性返回健康账号；未命中或已冷却则降级择优并绑定，
 // 保持同一会话持续使用同一账号，最大化大模型服务端 Prompt/KV Cache 命中率。
 func (p *Pool) PickAffinity(sessionKey string, tried map[string]bool) *auth.Auth {
+	return p.PickAffinityForModel(sessionKey, tried, "")
+}
+
+// PickAffinityForModel 同 PickAffinity，但只在能力上可承接 model 的账号里选/绑定。
+//
+// 必要性：solo_agent 通道下模型集按账号漂移（实测 4 号 68/68/69/71 条，
+// free/flash/pro/claude-opus-5 只在其中一个号上）。若粘性绑定与能力无关，
+// 这些模型会间歇性 400/503 —— 列表说有、轮到没有该模型的号又失败。
+// model 为空 = 不做能力限制（等价旧行为）。
+func (p *Pool) PickAffinityForModel(sessionKey string, tried map[string]bool, model string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
@@ -464,10 +552,10 @@ func (p *Pool) PickAffinity(sessionKey string, tried map[string]bool) *auth.Auth
 	if sessionKey != "" {
 		if aff, ok := p.affinity[sessionKey]; ok {
 			if tried == nil || !tried[aff.uid] {
-				if e, exists := p.byUID[aff.uid]; exists && e.healthy(now) {
+				if e, exists := p.byUID[aff.uid]; exists && servesLocked(e, model, now) {
 					// 临期压制：若存在明显更早到期的健康账号，放弃粘性改绑。
 					// 只按到期时间判定，不掺积分/UID —— 规则①优先于缓存收益。
-					if best := p.bestByRuleLocked(tried, now); expirePressure(best, e) {
+					if best := p.bestByRuleLocked(tried, now, model); expirePressure(best, e) {
 						p.affinity[sessionKey] = affinityEntry{uid: best.a.UID, lastSeen: now}
 						best.lastUsed = now
 						return best.a
@@ -482,7 +570,7 @@ func (p *Pool) PickAffinity(sessionKey string, tried map[string]bool) *auth.Auth
 	}
 
 	// 2. 无粘性绑定或原账号已不可用/已满载，走三因子规则序（非加权）与防惊群短名单调度
-	best := p.pickBestCandidateLocked(tried, now)
+	best := p.pickBestCandidateLocked(tried, now, model)
 	if best == nil {
 		return nil
 	}

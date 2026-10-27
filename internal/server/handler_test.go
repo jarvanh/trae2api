@@ -236,16 +236,28 @@ func TestModelsEndpoint(t *testing.T) {
 		t.Errorf("object=%v", resp["object"])
 	}
 	data := resp["data"].([]any)
-	// 动态拉取在单测里必失败（无真实上游），走的是 staticModels 回退表。
-	if len(data) != len(staticModels) {
-		t.Errorf("models count=%d want %d", len(data), len(staticModels))
+	// 动态拉取在单测里必失败（无真实上游），走的是 staticModels 回退表 ——
+	// 且回退同样要过展示口径（剔掉 custom_model_* / summary 等占位项），
+	// 否则 /v1/models 与管理台两处计数会不一致。
+	want := 0
+	for _, m := range staticModels {
+		if id, _ := m["id"].(string); !isInternalModel(id) {
+			want++
+		}
+	}
+	if len(data) != want {
+		t.Errorf("models count=%d want %d (static=%d 去掉内部项)", len(data), want, len(staticModels))
 	}
 	if len(data) == 0 {
 		t.Fatal("empty static fallback table")
 	}
 	found := false
 	for _, m := range data {
-		if m.(map[string]any)["id"] == "glm-5.2" {
+		id, _ := m.(map[string]any)["id"].(string)
+		if isInternalModel(id) {
+			t.Errorf("内部/占位模型不应出现在 /v1/models：%s", id)
+		}
+		if id == "glm-5.2" {
 			found = true
 		}
 	}
@@ -845,5 +857,143 @@ func newFakeUpstreamPath(t *testing.T, chatCalls *int32, behavior func(auth stri
 		UgHost:    "https://fake.example",
 		OAuthHost: "https://fake.example",
 		ClientID:  upstream.ClientID,
+	}
+}
+
+// resetModelCache 清掉进程级模型缓存，让单个用例自己控制拉取。
+func resetModelCache(t *testing.T) {
+	t.Helper()
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.ids = nil
+	dynamicModelsCache.fetched = time.Time{}
+	dynamicModelsCache.lastFail = time.Time{}
+	dynamicModelsCache.refreshing = false
+	dynamicModelsCache.Unlock()
+	t.Cleanup(func() {
+		dynamicModelsCache.Lock()
+		dynamicModelsCache.ids = nil
+		dynamicModelsCache.fetched = time.Time{}
+		dynamicModelsCache.lastFail = time.Time{}
+		dynamicModelsCache.refreshing = false
+		dynamicModelsCache.Unlock()
+	})
+}
+
+func modelsJSON(ids ...string) string {
+	var b strings.Builder
+	b.WriteString(`{"config_info_list":[`)
+	for i, id := range ids {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString(`{"config_name":"` + id + `","context_window_tokens":{"dev":1000000},` +
+			`"model_detail_list":[{"model_name":"` + id + `__max","prompt_max_tokens":936000,"max_tokens":64000}]}`)
+	}
+	b.WriteString("]}")
+	return b.String()
+}
+
+// TestFetchModelsUnionAcrossAccounts 覆盖 2026-10-27 修复：solo_agent 的模型集
+// 按账号漂移（free 只在一个号上）。只问一个号会让 /v1/models 间歇性漏模型，
+// 必须取跨账号并集，并把每号能力写回 pool 供选号过滤。
+func TestFetchModelsUnionAcrossAccounts(t *testing.T) {
+	resetModelCache(t)
+	var calls int32
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			atomic.AddInt32(&calls, 1)
+			var body string
+			switch r.Header.Get("Authorization") {
+			case "Cloud-IDE-JWT at1":
+				body = modelsJSON("glm-5.3", "free")
+			case "Cloud-IDE-JWT at2":
+				body = modelsJSON("glm-5.3", "pro")
+			default:
+				body = `{"config_info_list":[]}`
+			}
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		})},
+		AgentHost: "https://fake.example", UgHost: "https://fake.example",
+		OAuthHost: "https://fake.example", ClientID: upstream.ClientID,
+	}
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	infos := h.fetchDynamicModels()
+	byID := map[string]upstream.ModelInfo{}
+	for _, mi := range infos {
+		byID[mi.ID] = mi
+	}
+	// 并集：两号各自的独占模型都要在
+	for _, id := range []string{"glm-5.3", "free", "pro"} {
+		if _, ok := byID[id]; !ok {
+			t.Errorf("并集缺少模型 %s（got %d 条）", id, len(infos))
+		}
+	}
+	if n := atomic.LoadInt32(&calls); n != 2 {
+		t.Errorf("应按账号各拉一次，calls=%d", n)
+	}
+	// 能力集写回 pool：free 只有 u1 能接
+	if got := p.PickAffinityForModel("", nil, "free"); got == nil || got.UID != "u1" {
+		t.Errorf("选号未按能力过滤，got=%v want u1", got)
+	}
+	if got := p.PickAffinityForModel("", nil, "pro"); got == nil || got.UID != "u2" {
+		t.Errorf("选号未按能力过滤，got=%v want u2", got)
+	}
+}
+
+// TestModelListHidesInternalConfigs 覆盖展示口径统一：上游把 custom_model_* /
+// summary 标成「可见」但实为占位项，/v1/models 与管理台都必须隐藏；
+// 同时 knownModel 仍要接受它们（只影响展示，不影响路由）。
+func TestModelListHidesInternalConfigs(t *testing.T) {
+	resetModelCache(t)
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body: io.NopCloser(strings.NewReader(`{"config_info_list":[
+					{"config_name":"glm-5.3","context_window_tokens":{"dev":1000000},
+					 "model_detail_list":[{"model_name":"g__max","prompt_max_tokens":936000,"max_tokens":64000}]},
+					{"config_name":"custom_model_1M","context_window_tokens":{"dev":1000000},
+					 "model_detail_list":[{"model_name":"c","prompt_max_tokens":936000,"max_tokens":64000}]},
+					{"config_name":"summary","context_window_tokens":{"dev":200000},
+					 "model_detail_list":[{"model_name":"s","prompt_max_tokens":168000,"max_tokens":32000}]},
+					{"config_name":"title_gen","is_invisible_to_user":true,"context_window_tokens":{"dev":200000},
+					 "model_detail_list":[{"model_name":"t","prompt_max_tokens":168000,"max_tokens":32000}]}
+				]}`)),
+			}, nil
+		})},
+		AgentHost: "https://fake.example", UgHost: "https://fake.example",
+		OAuthHost: "https://fake.example", ClientID: upstream.ClientID,
+	}
+	h := NewHandler(Config{
+		Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}), Upstream: up,
+	})
+
+	got := map[string]bool{}
+	for _, m := range h.modelList() {
+		got[m["id"].(string)] = true
+	}
+	if !got["glm-5.3"] {
+		t.Error("真实模型应展示")
+	}
+	for _, hidden := range []string{"custom_model_1M", "summary", "title_gen"} {
+		if got[hidden] {
+			t.Errorf("%s 是内部/占位配置，不应出现在 /v1/models", hidden)
+		}
+	}
+	// 路由口径不变宽于展示口径：knownModel 仍接受这些 config
+	for _, id := range []string{"custom_model_1M", "summary", "title_gen"} {
+		if !h.knownModel(id) {
+			t.Errorf("knownModel(%s) 应为 true：展示过滤不得影响路由", id)
+		}
 	}
 }

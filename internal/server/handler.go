@@ -313,16 +313,27 @@ var staticModels = []map[string]any{
 }
 
 // dynamicModelsCache 动态模型缓存（成功 1h / 失败负缓存 5min）。
+//
+// refreshing 是单飞标志：跨账号并集刷新要向池内每个账号各发一次
+// get_detail_param（实测单号响应 1.44MB），比旧的单号版贵 N 倍，
+// 绝不能被并发请求放大。
 var dynamicModelsCache struct {
 	sync.RWMutex
-	ids      []upstream.ModelInfo
-	fetched  time.Time
-	lastFail time.Time
+	ids        []upstream.ModelInfo
+	fetched    time.Time
+	lastFail   time.Time
+	refreshing bool
 }
 
 const (
-	dynamicModelsTTL        = time.Hour
-	modelsFetchFailCooldown = 5 * time.Minute
+	dynamicModelsTTL = time.Hour
+	// modelsFetchFailCooldown 全部账号都拉失败后的负缓存时长：这段时间内不再
+	// 扇出（否则每个 /v1/models 请求都打 N 次上游），也不再反复空刷。
+	// 取 30s（原 5min）：并集失败通常是短时抖动，5min 会让新上线的模型迟迟不出现。
+	modelsFetchFailCooldown = 30 * time.Second
+	// modelsFetchPerAccountTimeout 单账号拉模型表的硬超时。不设的话一个挂死的
+	// 账号会把整轮并集刷新拖到 HTTP 客户端全局超时（实测上游偶发挂住）。
+	modelsFetchPerAccountTimeout = 25 * time.Second
 )
 
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
@@ -332,15 +343,34 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// modelList 动态获取模型列表并包装成 OpenAI 格式；失败回退静态表。
+// displayModel 判断某 config 是否该出现在对外的模型列表里。
 //
-// 只列面向用户的配置：invisible 的内部配置（*_auto / sub_agent / title_generation
-// 等）不展示，但仍可被 knownModel 路由（见其注释）。
+// 两个条件缺一不可：
+//   - is_invisible_to_user：上游标的内部配置（*_auto / sub_agent 等）
+//   - isInternalModel：命名启发式补集 —— 上游把 custom_model_* / summary /
+//
+// input_optimization 标成「可见」，但它们实测是占位或
+//
+//	内部功能位（custom_model_1M 实测 503 code=3003）。管理台一直在隐藏它们，
+//	/v1/models 若跟着上游标走就会两处口径不一致，客户端选择器也会塞满不可用项。
+//
+// 只影响展示，不影响路由：knownModel 仍接受全部 config（见其注释）。
+func displayModel(mi upstream.ModelInfo) bool {
+	return displayableModel(mi.Invisible, mi.ID)
+}
+
+// displayableModel 是 /v1/models 与管理台共用的展示口径（单一事实源）。
+// 两处各自实现过一次就漂移过一回，故收敛到这一个函数。
+func displayableModel(invisible bool, id string) bool {
+	return !invisible && !isInternalModel(id)
+}
+
+// modelList 动态获取模型列表并包装成 OpenAI 格式；失败回退静态表。
 func (h *Handler) modelList() []map[string]any {
 	if infos := h.fetchDynamicModels(); len(infos) > 0 {
 		out := make([]map[string]any, 0, len(infos))
 		for _, mi := range infos {
-			if mi.Invisible {
+			if !displayModel(mi) {
 				continue
 			}
 			entry := map[string]any{
@@ -365,40 +395,177 @@ func (h *Handler) modelList() []map[string]any {
 		}
 		return out
 	}
-	return staticModels
+	// 静态回退表同样过一遍展示口径：表里也混着 custom_model_* / summary 等占位项。
+	out := make([]map[string]any, 0, len(staticModels))
+	for _, m := range staticModels {
+		if id, _ := m["id"].(string); isInternalModel(id) {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
-// fetchDynamicModels 从池中任一健康账号拉模型列表（get_detail_param），缓存 1h。
+// fetchDynamicModels 取跨账号并集的模型表，缓存 1h。
+//
+// 为什么不能只问一个号（旧行为）：solo_agent 的模型集按账号漂移 —— 实测 4 个
+// 账号分别返回 68/68/69/71 条，free/flash/pro/claude-opus-5 只在其中一个号上。
+// 只问一个号并缓存 1h，会让 /v1/models 列出「本轮那个号有、下轮换号就没」的
+// 模型，客户端间歇性 400/503。
+//
+// 并发语义（stale-while-revalidate）：
+//   - 缓存新鲜 → 直接返回；
+//   - 过期但非空 → 立即返回旧数据，由后台 goroutine 单飞刷新（单飞标志保证
+//     同一时刻至多一轮跨号扇出），绝不阻塞请求。并集刷新要向每个号各发一次
+//     get_detail_param（实测单号 1.44MB），同步做会把 TTL 边界上的那一个请求
+//     拖出可感知的延迟；
+//   - 无数据（冷启动/上轮全败）→ 同步刷新一次，宁可这一个请求慢，也不能
+//     拿静态回退表糊弄唯一需要真实数据的场景。
 func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	dynamicModelsCache.RLock()
-	if len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL {
-		out := dynamicModelsCache.ids
-		dynamicModelsCache.RUnlock()
-		return out
-	}
-	if !dynamicModelsCache.lastFail.IsZero() && time.Since(dynamicModelsCache.lastFail) < modelsFetchFailCooldown {
-		dynamicModelsCache.RUnlock()
-		return nil
-	}
+	fresh := len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL
+	negCached := !dynamicModelsCache.lastFail.IsZero() && time.Since(dynamicModelsCache.lastFail) < modelsFetchFailCooldown
+	cached := dynamicModelsCache.ids
 	dynamicModelsCache.RUnlock()
 
-	acct := h.cfg.Pool.Pick()
-	if acct == nil {
+	if fresh {
+		return cached
+	}
+	if len(cached) > 0 {
+		// 有旧数据：后台异步刷，本请求立即返回旧表。
+		go h.refreshModelCacheAsync()
+		return cached
+	}
+	if negCached {
 		return nil
 	}
-	infos, err := h.cfg.Upstream.FetchModels(acct)
-	if err != nil || len(infos) == 0 {
-		dynamicModelsCache.Lock()
-		dynamicModelsCache.lastFail = time.Now()
-		dynamicModelsCache.Unlock()
+
+	// 冷启动：同步刷，保证首次 /v1/models 与首次选号就能拿到真表。
+	infos, ok := h.refreshModelCacheOnce()
+	if !ok {
 		return nil
 	}
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = infos
-	dynamicModelsCache.fetched = time.Now()
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
 	return infos
+}
+
+// refreshModelCacheAsync 后台单飞刷新；已有刷新在跑时直接退出。
+func (h *Handler) refreshModelCacheAsync() {
+	if _, ok := h.refreshModelCacheOnce(); !ok {
+		// 失败已记负缓存；冷启动兜底由下一次真实请求触发。
+		return
+	}
+}
+
+// refreshModelCacheOnce 单飞地执行一轮并集刷新。
+// 返回 (新表, 是否成功)。调用方不要并发扇出本函数 —— 单飞标志会合并并发请求。
+func (h *Handler) refreshModelCacheOnce() ([]upstream.ModelInfo, bool) {
+	dynamicModelsCache.Lock()
+	// 锁内复查：关掉「读判需要刷 → 抢到锁」窗口里的竞态，保证至多一轮在刷。
+	if dynamicModelsCache.refreshing ||
+		(len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL) ||
+		(!dynamicModelsCache.lastFail.IsZero() && time.Since(dynamicModelsCache.lastFail) < modelsFetchFailCooldown) {
+		out := dynamicModelsCache.ids
+		dynamicModelsCache.Unlock()
+		return out, len(out) > 0
+	}
+	dynamicModelsCache.refreshing = true
+	dynamicModelsCache.Unlock()
+
+	infos := h.refreshModelUnion()
+
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.refreshing = false
+	if len(infos) > 0 {
+		dynamicModelsCache.ids = infos
+		dynamicModelsCache.fetched = time.Now()
+		dynamicModelsCache.lastFail = time.Time{}
+	} else {
+		dynamicModelsCache.lastFail = time.Now()
+	}
+	out := dynamicModelsCache.ids
+	dynamicModelsCache.Unlock()
+	return out, len(infos) > 0
+}
+
+// refreshModelUnion 并发向全部健康账号拉模型表，取并集，并把每号能力集写回 pool
+// （选号过滤用，见 PickAffinityForModel）。返回 nil = 一个号都没成功。
+func (h *Handler) refreshModelUnion() []upstream.ModelInfo {
+	if h.cfg.Pool == nil || h.cfg.Upstream == nil {
+		return nil
+	}
+	accts := h.cfg.Pool.Healthy()
+	if len(accts) == 0 {
+		return nil
+	}
+	results := make([]*[]upstream.ModelInfo, len(accts))
+	var wg sync.WaitGroup
+	for i, a := range accts {
+		wg.Add(1)
+		go func(i int, a *auth.Auth) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), modelsFetchPerAccountTimeout)
+			defer cancel()
+			infos, err := h.cfg.Upstream.FetchModelsCtx(ctx, a)
+			if err != nil || len(infos) == 0 {
+				// 显式清能力集：宁可回到「不限制」，也别拿上一轮老数据继续卡选号。
+				h.cfg.Pool.SetModels(a.UID, nil)
+				return
+			}
+			ids := make([]string, 0, len(infos))
+			for _, mi := range infos {
+				ids = append(ids, mi.ID)
+			}
+			h.cfg.Pool.SetModels(a.UID, ids)
+			results[i] = &infos
+		}(i, a)
+	}
+	wg.Wait()
+
+	// 并集：同 ID 各字段取跨号最大值（能力档随套餐浮动，取见过的最强档）；
+	// Invisible 收紧为「所有号都隐藏」——任一号可见即对外可见。
+	byID := make(map[string]upstream.ModelInfo, 256)
+	order := make([]string, 0, 256)
+	for _, p := range results {
+		if p == nil {
+			continue
+		}
+		for _, mi := range *p {
+			if mi.ID == "" {
+				continue
+			}
+			cur, seen := byID[mi.ID]
+			if !seen {
+				byID[mi.ID] = mi
+				order = append(order, mi.ID)
+				continue
+			}
+			if mi.ContextWindow > cur.ContextWindow {
+				cur.ContextWindow = mi.ContextWindow
+			}
+			if mi.PromptMaxTokens > cur.PromptMaxTokens {
+				cur.PromptMaxTokens = mi.PromptMaxTokens
+			}
+			if mi.MaxTokens > cur.MaxTokens {
+				cur.MaxTokens = mi.MaxTokens
+			}
+			if cur.Name == "" {
+				cur.Name = mi.Name
+			}
+			if cur.Rate == 0 {
+				cur.Rate = mi.Rate
+			}
+			cur.Invisible = cur.Invisible && mi.Invisible
+			byID[mi.ID] = cur
+		}
+	}
+	if len(order) == 0 {
+		return nil
+	}
+	out := make([]upstream.ModelInfo, 0, len(order))
+	for _, id := range order {
+		out = append(out, byID[id])
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -665,9 +832,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.cfg.Pool.Acquire(uid)
 	}
 
+	// 能力过滤（2026-10-27）：solo_agent 的模型集按账号漂移（实测 4 号分别
+	// 68/68/69/71 条，free/flash/pro/claude-opus-5 只在一个号上）。并集刷新已把
+	// 每号能力写进 pool，这里据此只选真能承接该 config 的号 —— 否则模型列表
+	// 说有、轮到没这个号的账号就失败，等于把 400 换成了 503。
+	//
+	// 只在「该 config 确实被某个号报告过」时开启过滤：查不到的名字（Work 透传
+	// 模型、或能力数据尚未探到）必须回退成不限制。能力过滤是优化，不是闸门 ——
+	// 拿缺失的数据去拒请求，会把本来能跑通的调用打死。
+	capFilter := ""
+	if h.cfg.Pool.ModelKnown(configName) {
+		capFilter = configName
+	}
+
 	tried := map[string]bool{}
 	for i := 0; i < h.cfg.MaxRotate; i++ {
-		acct := h.cfg.Pool.PickAffinity(sessionKey, tried)
+		// 注意：换模型会重绑 sessionKey（绑定账号没这能力时按能力重选），
+		// 牺牲一点 KV cache 命中率换路由正确性 —— 后者更重要。
+		acct := h.cfg.Pool.PickAffinityForModel(sessionKey, tried, capFilter)
 		if acct == nil {
 			break
 		}
@@ -821,6 +1003,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st.status = http.StatusServiceUnavailable
+	// 一次号都没轮到 + 开了能力过滤 = 池里没有能承接该模型的账号。
+	// 这和「全在冷却」是两回事，分开报错才排得动（也方便上游侧看出是能力漂移还是号池耗尽）。
+	if capFilter != "" && len(tried) == 0 {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "model_unavailable",
+			"no healthy account serves model "+capFilter+" (per-account model set)")
+		return
+	}
 	msg := "all accounts unavailable (cooling/disabled)"
 	if lastErr != nil {
 		msg += ": " + lastErr.Error()

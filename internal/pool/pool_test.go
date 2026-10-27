@@ -642,3 +642,104 @@ func TestApplyUsageRemainNoLedger(t *testing.T) {
 		t.Fatalf("unexpected packs: %+v", ps)
 	}
 }
+
+// TestPickForModelCapability 覆盖 solo_agent 通道模型集按账号漂移的场景：
+// 只有真报告了该 config 的账号才能被选中，否则会间歇性失败。
+func TestPickForModelCapability(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at1"})
+	p.Add(&auth.Auth{UID: "u2", AccessToken: "at2"})
+	p.SetCredits("u1", 1000)
+	p.SetCredits("u2", 1000)
+	p.SetModels("u1", []string{"glm-5.3"})
+	p.SetModels("u2", []string{"glm-5.3", "free"})
+
+	// free 只在 u2 上：即便 u1 按规则②并列更靠前，也不能选它
+	if got := p.PickAffinityForModel("", nil, "free"); got == nil || got.UID != "u2" {
+		t.Fatalf("pick(free)=%v want u2", got)
+	}
+	// glm-5.3 两号都有：回到常规规则序（积分并列 → UID 升序）
+	if got := p.PickAffinityForModel("", nil, "glm-5.3"); got == nil || got.UID != "u1" {
+		t.Fatalf("pick(glm-5.3)=%v want u1", got)
+	}
+	if !p.ModelKnown("free") || p.ModelKnown("nope") {
+		t.Error("ModelKnown 判定错误")
+	}
+}
+
+// TestPickNoModelKeepsRuleOrder 传空 model = 不做能力限制（等价旧行为）。
+// 单独开一个干净池：上一用例里两个号都刚被 pick 过，会被 minPickGap 防惊群
+// 窗口改挑「久未使用」的那个，混在一起测不出规则序。
+func TestPickNoModelKeepsRuleOrder(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at1"})
+	p.Add(&auth.Auth{UID: "u2", AccessToken: "at2"})
+	p.SetCredits("u1", 1000)
+	p.SetCredits("u2", 1000)
+	p.SetModels("u1", []string{"glm-5.3"})
+	p.SetModels("u2", []string{"glm-5.3", "free"})
+
+	if got := p.PickAffinityForModel("", nil, ""); got == nil || got.UID != "u1" {
+		t.Fatalf("pick(不限制)=%v want u1", got)
+	}
+	// 只给能力全都不匹配的 model → 候选集为空，必须返回 nil（由调用方给出明确错）
+	if got := p.PickAffinityForModel("", nil, "only-on-unknown-account"); got != nil {
+		t.Fatalf("两号都没这能力时应返回 nil，got=%v", got)
+	}
+}
+
+// TestPickForModelUnprobedNotRestricted 未探测能力集的账号必须视为「什么都能接」：
+// 能力数据缺失时宁可不限制，也不能让整池凭空 503。
+func TestPickForModelUnprobedNotRestricted(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "probed", AccessToken: "at1"})
+	p.Add(&auth.Auth{UID: "unprobed", AccessToken: "at2"})
+	p.SetCredits("probed", 100)
+	p.SetCredits("unprobed", 5000) // 积分更多，规则②本应排在后面
+	p.SetModels("probed", []string{"glm-5.3"})
+
+	if got := p.PickAffinityForModel("", nil, "some-new-model"); got == nil || got.UID != "unprobed" {
+		t.Fatalf("未探测账号应作为兜底可选，got=%v", got)
+	}
+	// 清能力后恢复不限制：probed 回到候选集，且规则②（积分最少者胜）选它
+	p.SetModels("probed", nil)
+	if got := p.PickAffinityForModel("", nil, "glm-5.3"); got == nil || got.UID != "probed" {
+		t.Fatalf("清除能力后应按规则序选中 probed，got=%v", got)
+	}
+}
+
+// TestPickAffinityRebindsForCapability 会话粘性不得凌驾于能力之上：
+// 绑定账号没有该模型的能力时，要改绑到有的账号（否则列表说有、请求却失败）。
+func TestPickAffinityRebindsForCapability(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at1"})
+	p.Add(&auth.Auth{UID: "u2", AccessToken: "at2"})
+	p.SetCredits("u1", 1000)
+	p.SetCredits("u2", 1000)
+	p.SetModels("u1", []string{"glm-5.3"})
+	p.SetModels("u2", []string{"glm-5.3", "free"})
+
+	if got := p.PickAffinityForModel("s1", nil, "glm-5.3"); got == nil || got.UID != "u1" {
+		t.Fatalf("首次绑定=%v want u1", got)
+	}
+	// 同会话换请求只有 u2 能承接的模型 → 必须重绑到 u2
+	if got := p.PickAffinityForModel("s1", nil, "free"); got == nil || got.UID != "u2" {
+		t.Fatalf("能力不匹配时应重绑，got=%v want u2", got)
+	}
+	// 重绑生效后，回到 u1 也能承接的模型仍按粘性走 u2（绑定已被改写）
+	if got := p.PickAffinityForModel("s1", nil, "glm-5.3"); got == nil || got.UID != "u2" {
+		t.Fatalf("粘性应延续到新绑定账号，got=%v want u2", got)
+	}
+}
+
+// TestHealthyExcludesCooling Healthy 供跨账号并集刷新用，必须跳过冷却/禁用号。
+func TestHealthyExcludesCooling(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at1"})
+	p.Add(&auth.Auth{UID: "u2", AccessToken: "at2"})
+	p.Cooldown("u2", CoolSoft, time.Minute, "429")
+	got := p.Healthy()
+	if len(got) != 1 || got[0].UID != "u1" {
+		t.Fatalf("healthy=%v want 只有 u1", got)
+	}
+}

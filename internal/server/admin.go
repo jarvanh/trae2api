@@ -184,8 +184,7 @@ func (h *Handler) adminModels(w http.ResponseWriter, r *http.Request) {
 			return items[i].ID < items[j].ID
 		})
 	}
-	// 默认隐藏上游内部配置：is_invisible_to_user=true 优先（实测 solo_agent 下 28/69 条），
-	// 再加命名启发式盖住上游标为可见但实为占位/内部的 custom_model_* 等。
+	// 默认隐藏内部配置：口径与 /v1/models 完全一致（displayableModel），
 	// 加 ?all=1 可看全量。
 	showAll := r.URL.Query().Get("all") == "1"
 	hidden := 0
@@ -196,7 +195,7 @@ func (h *Handler) adminModels(w http.ResponseWriter, r *http.Request) {
 		if !showAll {
 			kept := items[:0]
 			for _, it := range items {
-				if it.invisible || isInternalModel(it.ID) {
+				if !displayableModel(it.invisible, it.ID) {
 					hidden++
 					continue
 				}
