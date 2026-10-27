@@ -868,6 +868,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 只在「该 config 确实被某个号报告过」时开启过滤：查不到的名字（Work 透传
 	// 模型、或能力数据尚未探到）必须回退成不限制。能力过滤是优化，不是闸门 ——
 	// 拿缺失的数据去拒请求，会把本来能跑通的调用打死。
+	// 过滤同时覆盖 1005 模型门禁拉黑（BlockModel）：某号对某模型有钱也吃 1005
+	// 时，后续请求不再往它身上撞。
 	capFilter := ""
 	if h.cfg.Pool.ModelKnown(configName) {
 		capFilter = configName
@@ -927,6 +929,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			kind := upstream.Classify(status, string(respBody))
 			switch kind {
 			case upstream.ErrPlanLimit:
+				// 1005 归因：账本有钱 = 模型级套餐门禁 → 拉黑 (号,模型)，不冷却账号
+				//（2026-10-27 实弹：kimi-k3.1-pro 全号 1005 而各号账本 3000+）。
+				if h.cfg.Pool.Credits(acct.UID) > 0 {
+					h.cfg.Pool.BlockModel(acct.UID, configName)
+					lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+					continue
+				}
 				h.cfg.Pool.Cooldown(acct.UID, pool.CoolPlan, h.cfg.PlanCooldown, "plan 权益不足")
 				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 				if handled, _ := h.executeWorkRequest(w, r, body, configName, peek.Stream, sessionKey, st); handled {
@@ -979,7 +988,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 流内业务错误（1005 plan/5xx 等）→ 冷却账号，错误信息注入 SSE。
 			// Keepalive > 0 时在首帧到达前发 `: ping` 注释帧，防边缘网关静默掐断（502）。
 			_ = upstream.StreamWithUsageKeepalive(w, statsR, func(se *upstream.SOLOStreamError) {
-				h.handleStreamError(acct.UID, se)
+				h.handleStreamError(acct.UID, configName, se)
 			}, func(remain float64) {
 				// 流内记账（2026-10-16 定案）：notify_usage 账单事件 → 本地包账本
 				// FIFO 扣减。零额外上游请求，扣费后余额实时进 pool。
@@ -1012,6 +1021,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					writeOpenAIError(w, http.StatusBadRequest, "invalid_param",
 						"upstream rejected model/param (account-independent): "+se.Error())
 					return
+				}
+				// 1005 归因（2026-10-27 实弹）：账本有钱仍吃 1005 = 上游按模型
+				// 限制套餐（kimi-k3.1-pro 全号 1005、各号账本 3000+），是模型级
+				// 门禁而非账号耗尽 —— 拉黑 (号,模型) 即可，冷却账号会把一个
+				// 不可用模型放大成整池瘫痪。
+				if se.Kind() == upstream.ErrPlanLimit && h.cfg.Pool.Credits(acct.UID) > 0 {
+					h.cfg.Pool.BlockModel(acct.UID, configName)
+					continue
 				}
 				h.cfg.Pool.RecordError(acct.UID)
 				switch se.Kind() {
@@ -1053,7 +1070,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 这和「全在冷却」是两回事，分开报错才排得动（也方便上游侧看出是能力漂移还是号池耗尽）。
 	if capFilter != "" && len(tried) == 0 {
 		writeOpenAIError(w, http.StatusServiceUnavailable, "model_unavailable",
-			"no healthy account serves model "+capFilter+" (per-account model set)")
+			"no healthy account serves model "+capFilter+" (per-account model gates)")
 		return
 	}
 	msg := "all accounts unavailable (cooling/disabled)"
@@ -1065,9 +1082,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 // handleStreamError 流式响应中的上游业务错误 → pool 冷却状态机。
 // 1005 / 4008 plan 权益不足 → 长冷却；4011 限流 → 短冷却；其余（5xx/参数错误等）→ 累计错误冷却。
-func (h *Handler) handleStreamError(uid string, se *upstream.SOLOStreamError) {
+func (h *Handler) handleStreamError(uid, model string, se *upstream.SOLOStreamError) {
 	switch se.Kind() {
 	case upstream.ErrPlanLimit:
+		// 1005 归因：账本有钱 = 模型级套餐门禁 → 拉黑 (号,模型)，不冷却账号
+		//（2026-10-27 实弹：kimi-k3.1-pro 全号 1005 而各号账本 3000+）。
+		// 拉黑只挡这一个模型，账号对其他模型照常可用；TTL 1h 自愈重试。
+		if h.cfg.Pool.Credits(uid) > 0 {
+			h.cfg.Pool.BlockModel(uid, model)
+			return
+		}
 		h.cfg.Pool.Cooldown(uid, pool.CoolPlan, h.cfg.PlanCooldown, "plan 权益不足")
 	case upstream.ErrSoftRate:
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit")

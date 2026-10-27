@@ -119,13 +119,36 @@ func TestChatStreamPassthrough(t *testing.T) {
 
 func TestChatRotatesOnPlanLimit(t *testing.T) {
 	calls := map[string]int{}
-	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
-		calls[authz]++
-		if authz == "Cloud-IDE-JWT at-bad" {
-			return 200, "event:error\ndata:{\"code\":1005,\"message\":\"plan limit\",\"extra\":{\"plan\":2}}\n\n", true
-		}
-		return 200, soloSSE, true
-	})
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			// 只数对话请求；目录扇出（get_detail_param）不计入
+			if strings.HasSuffix(r.URL.Path, "/api/agent/v3/llm_utils_chat") {
+				calls[r.Header.Get("Authorization")]++
+				if r.Header.Get("Authorization") == "Cloud-IDE-JWT at-bad" {
+					return &http.Response{
+						StatusCode: 200,
+						Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+						Body:       io.NopCloser(strings.NewReader("event:error\ndata:{\"code\":1005,\"message\":\"plan limit\",\"extra\":{\"plan\":2}}\n\n")),
+					}, nil
+				}
+				return &http.Response{
+					StatusCode: 200,
+					Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+					Body:       io.NopCloser(strings.NewReader(soloSSE)),
+				}, nil
+			}
+			if strings.HasSuffix(r.URL.Path, "/api/ide/v1/get_detail_param") {
+				return &http.Response{
+					StatusCode: 200,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(modelsJSON("glm-5.2"))),
+				}, nil
+			}
+			return &http.Response{StatusCode: 404, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader("{}"))}, nil
+		})},
+		AgentHost: "https://fake.example", UgHost: "https://fake.example",
+		OAuthHost: "https://fake.example", ClientID: upstream.ClientID,
+	}
 	p := testPoolWith(
 		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
 		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
@@ -1063,5 +1086,101 @@ func TestChatInvalidParamDoesNotRotate(t *testing.T) {
 	// 池不受损：两号都不冷却不禁用，后续正常模型仍可选到任一号
 	if got := p.Pick(); got == nil {
 		t.Fatal("池应保持健康：账号无关 4xx 不得冷却任何账号")
+	}
+}
+
+// TestChatPlanGateBlocksModelNotAccount 覆盖 2026-10-27 实弹事故：kimi-k3.1-pro
+// 在交集目录里、但对话上游对所有号回 1005，而各号账本有 3000+ 积分 —— 这是
+// 模型级套餐门禁，不是账号耗尽。旧行为把 3 个号全打进 12h 冷却（整池自残）；
+// 现在账本有钱吃 1005 → 只拉黑 (号,模型)，账号对其他模型照常可用。
+func TestChatPlanGateBlocksModelNotAccount(t *testing.T) {
+	resetModelCache(t)
+	var calls int32
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, "/api/ide/v1/get_detail_param") {
+				return &http.Response{
+					StatusCode: 200,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(modelsJSON("kimi-k3.1-pro", "glm-5.3"))),
+				}, nil
+			}
+			if strings.HasSuffix(r.URL.Path, "/api/agent/v3/llm_utils_chat") {
+				atomic.AddInt32(&calls, 1)
+				// 按上游 body 里的 config_name 分流：kimi-k3.1-pro 永远 1005，其余正常
+				raw, _ := io.ReadAll(r.Body)
+				var peek struct {
+					ConfigName string `json:"config_name"`
+				}
+				_ = json.Unmarshal(raw, &peek)
+				if peek.ConfigName == "kimi-k3.1-pro" {
+					return &http.Response{
+						StatusCode: 200,
+						Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+						Body: io.NopCloser(strings.NewReader(
+							"event:error\ndata:{\"code\":1005,\"message\":\"plan limit\",\"extra\":{\"plan\":2}}\n\n")),
+					}, nil
+				}
+				return &http.Response{
+					StatusCode: 200,
+					Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+					Body:       io.NopCloser(strings.NewReader(soloSSE)),
+				}, nil
+			}
+			return &http.Response{StatusCode: 404, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader("{}"))}, nil
+		})},
+		AgentHost: "https://fake.example", UgHost: "https://fake.example",
+		OAuthHost: "https://fake.example", ClientID: upstream.ClientID,
+	}
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("u1", 3000)
+	p.SetCredits("u2", 3000)
+	// 关掉 Work 兜底：不显式禁用时 NewHandler 会自动创建真 WorkClient，
+	// solo 轮转穷尽后 executeWorkRequest 拿假 token 打真实上游吃 401，
+	// 把两个号 Disable("work session dead")——测的是夹具泄漏而非拉黑语义。
+	h := NewHandler(Config{Pool: p, Upstream: up, WorkMode: upstream.WorkModeDisabled})
+
+	// 第一次：kimi-k3.1-pro 轮完全部号都 1005 → 拉黑而非冷却
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"kimi-k3.1-pro","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Errorf("每号各试一次，calls=%d want 2", got)
+	}
+	for _, uid := range []string{"u1", "u2"} {
+		st, _ := p.Status(uid)
+		if st.Cooling {
+			t.Errorf("%s 不应被冷却（账本有钱，1005 是模型门禁）", uid)
+		}
+	}
+
+	// 第二次：同模型直接 503，不再打上游（全部 (号,模型) 已拉黑）
+	atomic.StoreInt32(&calls, 0)
+	req2 := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"kimi-k3.1-pro","messages":[{"role":"user","content":"hi"}]}`))
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req2)
+	if got := atomic.LoadInt32(&calls); got != 0 {
+		t.Errorf("拉黑后不应再打上游，calls=%d", got)
+	}
+	if rec2.Code != http.StatusServiceUnavailable {
+		t.Errorf("code=%d want 503, body=%s", rec2.Code, rec2.Body)
+	}
+
+	// 第三次：同池换 glm-5.3 仍正常 —— 拉黑只挡 kimi-k3.1-pro 一个模型，
+	// 账号没被冷却/禁用，正常模型照常走通上游拿到 200。
+	req3 := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.3","messages":[{"role":"user","content":"hi"}]}`))
+	rec3 := httptest.NewRecorder()
+	h.ServeHTTP(rec3, req3)
+	if got := atomic.LoadInt32(&calls); got == 0 {
+		t.Fatal("glm-5.3 应仍能选到账号发起上游调用（拉黑不得殃及账号）")
+	}
+	if rec3.Code != http.StatusOK {
+		t.Errorf("glm-5.3 code=%d want 200, body=%s", rec3.Code, rec3.Body)
 	}
 }

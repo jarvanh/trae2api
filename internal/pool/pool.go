@@ -105,6 +105,12 @@ type entry struct {
 	// 每轮目录刷新重建，持久化反而会把已下线的模型钉死半天。
 	models map[string]bool
 
+	// modelBlocks (号,模型) 级 1005 门禁拉黑：账本有钱仍被上游回 1005 =
+	// 上游按模型限制套餐（2026-10-27 实弹：kimi-k3.1-pro 全号 1005、各号
+	// 账本 3000+），不是账号权益耗尽，绝不能按老逻辑冷却账号。只存内存：
+	// 重启清零 + TTL 自愈，上游放开后自动恢复尝试。
+	modelBlocks map[string]time.Time
+
 	// 签到设备轮换代数与 9074 退避状态（持久化于 state.json，跨重启生效）。
 	// 代数只增不减：被风控标记的设备号一旦弃用就不再回头。
 	checkinGen        int
@@ -323,7 +329,50 @@ func servesLocked(e *entry, model string, now time.Time) bool {
 	if model != "" && e.models != nil && !e.models[model] {
 		return false
 	}
+	if e.blockedFor(model, now) {
+		return false
+	}
 	return true
+}
+
+// modelBlockTTL (号,模型) 拉黑的存活期：到期自动重试（上游可能已放开该模型）。
+const modelBlockTTL = time.Hour
+
+// blockedFor 判断该账号是否因 1005 门禁被拉黑某模型。
+// 纯读：调用方可能持 RLock（pickExcludingModel / pickBestCandidateLocked），
+// 这里绝不能删 map 项（写操作会数据竞争）；过期项由 BlockModel 写锁内顺手清理。
+func (e *entry) blockedFor(model string, now time.Time) bool {
+	if model == "" || len(e.modelBlocks) == 0 {
+		return false
+	}
+	t, ok := e.modelBlocks[model]
+	if !ok {
+		return false
+	}
+	return now.Sub(t) < modelBlockTTL
+}
+
+// BlockModel 拉黑 (号,模型) 对：该账号账本有钱却对某模型吃 1005（模型级套餐门禁）。
+// 选号时跳过该组合（见 servesLocked），但不影响账号对其他模型的可用性。
+func (p *Pool) BlockModel(uid, model string) {
+	if model == "" {
+		return
+	}
+	now := time.Now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		if e.modelBlocks == nil {
+			e.modelBlocks = map[string]time.Time{}
+		}
+		e.modelBlocks[model] = now
+		// 写锁内顺手清过期项，防止长期运行下 map 无界增长（每 (号,模型) 一条，很小但白占）。
+		for m, t := range e.modelBlocks {
+			if now.Sub(t) >= modelBlockTTL {
+				delete(e.modelBlocks, m)
+			}
+		}
+	}
 }
 
 // ModelKnown 判断 model 是否被至少一个账号的能力集覆盖（不看健康度）。
