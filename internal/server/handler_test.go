@@ -997,3 +997,65 @@ func TestModelListHidesInternalConfigs(t *testing.T) {
 		}
 	}
 }
+
+// TestChatInvalidParamDoesNotRotate 覆盖 2026-10-27 实弹事故：目录里有但上游
+// 对话不认的模型（free/pro/flash）回 4001 invalid param，这是账号无关的 4xx ——
+// 换号必然复现，还会把整池打冷却。必须立即透传 400，不冷却、不计错、不轮换。
+func TestChatInvalidParamDoesNotRotate(t *testing.T) {
+	var calls int32
+	// 目录端点正常返回（free 在并集表里），对话端点回 4001 invalid param ——
+	// 复刻生产实弹：模型列表说有、对话上游不认。
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, "/api/ide/v1/get_detail_param") {
+				return &http.Response{
+					StatusCode: 200,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(modelsJSON("free"))),
+				}, nil
+			}
+			if strings.HasSuffix(r.URL.Path, "/api/agent/v3/llm_utils_chat") {
+				atomic.AddInt32(&calls, 1)
+				// 生产实弹形态：HTTP 200 + SSE 流内 event:error code=4001
+				return &http.Response{
+					StatusCode: 200,
+					Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+					Body:       io.NopCloser(strings.NewReader("event:error\ndata:{\"code\":4001,\"message\":\"We're sorry, the param is invalid. Please try with a valid param.\"}\n\n")),
+				}, nil
+			}
+			return &http.Response{StatusCode: 404, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader("{}"))}, nil
+		})},
+		AgentHost: "https://fake.example", UgHost: "https://fake.example",
+		OAuthHost: "https://fake.example", ClientID: upstream.ClientID,
+	}
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	resetModelCache(t)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"free","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	t.Logf("calls=%d code=%d body=%s", atomic.LoadInt32(&calls), rec.Code, rec.Body.String())
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("upstream called %d times, want 1 (account-independent 4xx must not rotate)", got)
+	}
+	if rec.Code != 400 {
+		t.Errorf("code=%d want 400, body=%s", rec.Code, rec.Body)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("body not json: %v", err)
+	}
+	if errObj, ok := resp["error"].(map[string]any); !ok || errObj["code"] != "invalid_param" {
+		t.Errorf("error payload = %v, want code invalid_param", resp["error"])
+	}
+	// 池不受损：两号都不冷却不禁用，后续正常模型仍可选到任一号
+	if got := p.Pick(); got == nil {
+		t.Fatal("池应保持健康：账号无关 4xx 不得冷却任何账号")
+	}
+}

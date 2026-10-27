@@ -919,6 +919,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.cfg.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, "upstream 404")
 				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 				continue
+			case upstream.ErrClient:
+				// 4xx 参数/请求级错误与账号无关（如上游 4001 invalid param）：
+				// 换号必然复现，还会把整池打冷却（2026-10-27 实弹：free/pro/flash/
+				// claude-opus-5 在目录里有、对话上游不认，3 号轮转后 2 个号进冷却）。
+				// 立即透传给调用方，不冷却、不计错、不轮换。
+				st.status = status
+				writeOpenAIError(w, http.StatusBadRequest, "invalid_param",
+					"upstream rejected model/param (account-independent): "+string(respBody))
+				return
 			case upstream.ErrUpstreamBusy:
 				// 502/504 是边缘网关（volc-dcdn/tengine）在算力紧张时掐断连接，与账号无关。
 				// 换号只会把 1 个请求放大成 N 个上游请求，加剧拥堵 → 不冷却、不计错、不轮换，
@@ -964,11 +973,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		resp, notifyRemain, haveRemain, err := upstream.Aggregate(rc)
 		rc.Close() // 已完全消费，立即释放上游连接（防轮转 continue 泄漏 body）
 		if err != nil {
-			h.cfg.Pool.RecordError(acct.UID)
-			// 流内业务错误（如 1005 plan 权益不足）→ 冷却账号并轮转下一账号。
+			// 流内业务错误：先分类再处置。账号无关的 4xx（如 free/pro/flash 的
+			// 4001 invalid param —— 目录里有、对话上游不认）换号必然复现，
+			// 轮换只会把整池打冷却（2026-10-27 实弹事故），必须立即透传。
 			var se *upstream.SOLOStreamError
 			if errors.As(err, &se) {
 				lastErr = err
+				if se.Kind() == upstream.ErrClient {
+					st.status = http.StatusBadRequest
+					writeOpenAIError(w, http.StatusBadRequest, "invalid_param",
+						"upstream rejected model/param (account-independent): "+se.Error())
+					return
+				}
+				h.cfg.Pool.RecordError(acct.UID)
 				switch se.Kind() {
 				case upstream.ErrPlanLimit:
 					h.cfg.Pool.Cooldown(acct.UID, pool.CoolPlan, h.cfg.PlanCooldown, "plan 权益不足")
@@ -977,6 +994,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 				continue
 			}
+			h.cfg.Pool.RecordError(acct.UID)
 			st.status = http.StatusBadGateway
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			return
