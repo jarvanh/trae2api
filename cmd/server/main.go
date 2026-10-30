@@ -89,6 +89,7 @@ func main() {
 		ErrThreshold:    cfg.Cooldown.ErrThresh,
 		ErrCooldown:     cfg.ErrCooldownDur,
 		DefaultModel:    cfg.DefaultModel,
+		MaxTierMode:     cfg.Upstream.MaxTierMode,
 		WorkBridgeURL:   cfg.WorkBridgeURL,
 		WorkBridgeToken: cfg.WorkBridgeToken,
 		Keepalive:       time.Duration(cfg.Upstream.KeepaliveSeconds) * time.Second,

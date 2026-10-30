@@ -169,6 +169,15 @@ func (c *Client) function() string {
 	return Function
 }
 
+// FunctionSupportsMaxTier 判定当前 function 通道是否带 __max 档。
+// 2026-10-26 实测：solo_agent / chat_v3 有 __max 档（glm-5.3 = 1M/936K/64K），
+// solo_work_lite 无（只有 200K/168K/32K）。未收录的通道一律视为无 max 档，
+// 保守不改写 —— 改写错档位上游会按 dev 档 4022 拒。
+// 覆盖通道用 upstream.upstream_function 配置 / TW2A_FUNCTION 回滚。
+func (c *Client) FunctionSupportsMaxTier() bool {
+	return c.function() == FunctionHasMaxTier
+}
+
 func (c *Client) ugBase() string    { return c.UgHost }
 func (c *Client) oauthBase() string { return c.OAuthHost }
 
@@ -325,6 +334,10 @@ type ModelInfo struct {
 	// 实测部分 invisible 配置（如 kimi-k2.6）直接请求仍能正常返回，
 	// 因此不能把它们在 mapModel 门口一并拒掉。
 	Invisible bool
+	// HasMaxTier = get_detail_param 的 model_detail_list 是否含 __max 档。
+	// 仅当为 true 时请求才可改写 config_name=<model>__max（10-26 实测：
+	// 裸名或仅 extra_info 开关都会被 4022 prompt tokens exceeded 拒）。
+	HasMaxTier bool
 }
 
 // FetchModels 拉 SOLO 模型表（get_detail_param）。
@@ -387,9 +400,16 @@ func (c *Client) FetchModelsCtx(ctx context.Context, a *auth.Auth) ([]ModelInfo,
 			continue
 		}
 		// 多档模型（solo_agent 的 __dev/__max 双档）取容量最大的一档：
-		// 实测裸 config_name 请求即可吃下 max 档（930K 输入通过），
-		// 报 dev 档会把可用能力低估一半。
+		// 报 dev 档会把可用能力低估一半。max 档的请求改写见
+		// server.mapModel + setMaxModeInBody（裸名不够，10-26 实测结论）。
 		promptMax, maxOut := maxTierLimits(cfg.ModelDetailList)
+		hasMaxTier := false
+		for _, d := range cfg.ModelDetailList {
+			if strings.HasSuffix(d.ModelName, "__max") {
+				hasMaxTier = true
+				break
+			}
+		}
 		// 窗口至少要等于所选档的输入上限：少数模型 context_window_tokens
 		// 只写了 dev 值，直接取 max 会低估。
 		window := contextWindowTokens(cfg.ContextWindowTokens, promptMax)
@@ -404,6 +424,7 @@ func (c *Client) FetchModelsCtx(ctx context.Context, a *auth.Auth) ([]ModelInfo,
 			MaxTokens:       maxOut,
 			Rate:            consumptionRate(cfg.DisplayContactConfig),
 			Invisible:       cfg.IsInvisible,
+			HasMaxTier:      hasMaxTier,
 		})
 	}
 	if len(out) == 0 {

@@ -55,6 +55,10 @@ type Config struct {
 		// 带 __max 档 = 1M 窗口）。显式填 "solo_work_lite" 可回滚到旧通道
 		// （无 max 档，glm-5.3 只有 200K/168K/32K）。
 		Function string `json:"function"`
+		// MaxTierMode 裸名请求档位策略："auto"（默认，目录含 __max 档即升级到
+		// 1M 窗口）| "dev"（全保持 dev 档，回滚开关）。显式 <model>__max/__dev
+		// 点名不受此开关限制。
+		MaxTierMode string `json:"max_tier_mode"`
 	} `json:"upstream"`
 
 	// 解析后的 duration。
@@ -182,6 +186,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("TW2A_FUNCTION"); v != "" {
 		c.Upstream.Function = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("TW2A_MAX_TIER_MODE"); v != "" {
+		c.Upstream.MaxTierMode = strings.TrimSpace(v)
 	}
 }
 

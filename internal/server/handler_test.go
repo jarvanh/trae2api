@@ -1107,13 +1107,15 @@ func TestChatPlanGateBlocksModelNotAccount(t *testing.T) {
 			}
 			if strings.HasSuffix(r.URL.Path, "/api/agent/v3/llm_utils_chat") {
 				atomic.AddInt32(&calls, 1)
-				// 按上游 body 里的 config_name 分流：kimi-k3.1-pro 永远 1005，其余正常
+				// 按上游 body 里的 config_name 分流：kimi-k3.1-pro 永远 1005，其余正常。
+				// 剥 __max 后缀再比：门禁是模型级，max 档同样被拦（裸名请求在
+				// auto 策略下会被网关改写成 <model>__max + max 开关）。
 				raw, _ := io.ReadAll(r.Body)
 				var peek struct {
 					ConfigName string `json:"config_name"`
 				}
 				_ = json.Unmarshal(raw, &peek)
-				if peek.ConfigName == "kimi-k3.1-pro" {
+				if strings.TrimSuffix(peek.ConfigName, "__max") == "kimi-k3.1-pro" {
 					return &http.Response{
 						StatusCode: 200,
 						Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
@@ -1182,5 +1184,162 @@ func TestChatPlanGateBlocksModelNotAccount(t *testing.T) {
 	}
 	if rec3.Code != http.StatusOK {
 		t.Errorf("glm-5.3 code=%d want 200, body=%s", rec3.Code, rec3.Body)
+	}
+}
+
+// 2026-10-30 主人需求：裸名请求在 auto 策略 + 目录确认含 __max 档时默认升级 max 档。
+// 请求体必须同时含 model/config_name=<config>__max 与 extra_info.v2_max_mode_enabled=true
+// （10-26 实测配方，缺一都被 dev 档 4022 拒）。
+func TestChatBareModelAutoUpgradesToMaxTier(t *testing.T) {
+	resetModelCache(t)
+	var chatBody []byte
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, upstream.EpModels) {
+				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}},
+					Body: io.NopCloser(strings.NewReader(modelsJSON("glm-5.3")))}, nil
+			}
+			chatBody, _ = io.ReadAll(r.Body)
+			return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: io.NopCloser(strings.NewReader(soloSSE))}, nil
+		})},
+		AgentHost: "https://fake.example", UgHost: "https://fake.example",
+		OAuthHost: "https://fake.example", ClientID: upstream.ClientID,
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, WorkMode: upstream.WorkModeDisabled})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.3","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(chatBody, &body); err != nil {
+		t.Fatalf("chat body not json: %v", err)
+	}
+	if body["config_name"] != "glm-5.3__max" || body["model"] != "glm-5.3__max" {
+		t.Errorf("裸名应升级 __max: config_name=%v model=%v", body["config_name"], body["model"])
+	}
+	extra, ok := body["extra_info"].(map[string]any)
+	if !ok || extra["v2_max_mode_enabled"] != true {
+		t.Errorf("应注入 extra_info.v2_max_mode_enabled=true, got %v", body["extra_info"])
+	}
+}
+
+// 显式点名 __max 但目录无该档 → 400 不发上游（静默降级 dev 会把超 200K 请求烧成 4022）；
+// 显式 __dev 与无 max 档的裸名 → 保持 dev 档，不注入 max 开关。
+func TestChatExplicitTierWithoutMaxRejected(t *testing.T) {
+	resetModelCache(t)
+	var chatBody []byte
+	chatCalled := false
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, upstream.EpModels) {
+				body := `{"config_info_list":[{"config_name":"onlydev","context_window_tokens":{"dev":200000},` +
+					`"model_detail_list":[{"model_name":"onlydev__dev","prompt_max_tokens":168000,"max_tokens":32000}]}]}`
+				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}},
+					Body: io.NopCloser(strings.NewReader(body))}, nil
+			}
+			chatCalled = true
+			chatBody, _ = io.ReadAll(r.Body)
+			return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: io.NopCloser(strings.NewReader(soloSSE))}, nil
+		})},
+		AgentHost: "https://fake.example", UgHost: "https://fake.example",
+		OAuthHost: "https://fake.example", ClientID: upstream.ClientID,
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, WorkMode: upstream.WorkModeDisabled})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"onlydev__max","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400, body=%s", rec.Code, rec.Body)
+	}
+	if chatCalled {
+		t.Errorf("点名档不存在不应打上游")
+	}
+	var errResp struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &errResp)
+	if errResp.Error.Code != "invalid_request" || !strings.Contains(errResp.Error.Message, "__max") {
+		t.Errorf("error = %+v, want invalid_request + __max 提示", errResp.Error)
+	}
+
+	// 同一目录：裸名 onlydev（无 max 档）保持 dev 档，不加开关
+	req2 := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"onlydev","messages":[{"role":"user","content":"hi"}]}`))
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec2.Code, rec2.Body)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(chatBody, &body); err != nil {
+		t.Fatalf("chat body not json: %v", err)
+	}
+	if body["config_name"] != "onlydev" || body["model"] != "onlydev" {
+		t.Errorf("无 max 档应保持裸名: config_name=%v model=%v", body["config_name"], body["model"])
+	}
+	if _, has := body["extra_info"]; has {
+		t.Errorf("dev 档不应注入 extra_info, got %v", body["extra_info"])
+	}
+}
+
+// SOLO 1005 回退 Work 前必须剥离 max 改写：Work（native/bridge）无档位概念，
+// bridge 透传原始 body，残留 __max 名/开关可能被桥接端误消费。
+func TestChatWorkFallbackStripsMaxRewrite(t *testing.T) {
+	resetModelCache(t)
+	var taskBody []byte
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == upstream.EpCreateAgentTask {
+			taskBody, _ = io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte(mockWorkSSE))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, upstream.EpModels) {
+				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}},
+					Body: io.NopCloser(strings.NewReader(modelsJSON("glm-5.3")))}, nil
+			}
+			return &http.Response{StatusCode: 400, Header: http.Header{"Content-Type": []string{"application/json"}},
+				Body: io.NopCloser(strings.NewReader(`{"code":1005,"message":"plan limit exceeded"}`))}, nil
+		})},
+		AgentHost: "https://fake.example", UgHost: "https://fake.example",
+		OAuthHost: "https://fake.example", ClientID: upstream.ClientID,
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	p.SetWorkCredits("u1", 888.0)
+	workClient := upstream.NewWorkClient(upstream.WorkClientConfig{Host: ts.URL, Mode: upstream.WorkModeNative})
+	h := NewHandler(Config{Pool: p, Upstream: up, WorkClient: workClient, WorkMode: upstream.WorkModeNative})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.3","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "Hello from Work!") {
+		t.Errorf("missing Work content: %s", rec.Body.String())
+	}
+	task := string(taskBody)
+	if strings.Contains(task, "__max") || strings.Contains(task, "v2_max_mode_enabled") {
+		t.Errorf("work 回退请求泄漏 max 改写: %s", task)
 	}
 }

@@ -32,6 +32,10 @@
   实测「裸 `config_name`（不带 `__max`、不发 `extra_info.v2_max_mode_enabled`）在
   `solo_agent` 下即可吃下 930K 输入并正确召回首尾双针」，即上游按 config_name 自行选档。
   本仓库默认已切到 `solo_agent`（`upstream.function` 可回滚）。
+  **2026-10-30 更正**：10-26 复测仅 `extra_info.v2_max_mode_enabled` 不带 `__max` 名被 dev 档
+  4022 拒，裸名直吃的旧结论存疑；唯一验证过的 200 配方是 `solo_agent` + `<model>__max` +
+  `extra_info.v2_max_mode_enabled=true` 三件套。网关已默认按此改写（`upstream.max_tier_mode=auto`
+  时目录确认含 `__max` 档即注入；`dev` 可全量回滚），不再依赖裸名选档行为。
 - 模型表：`POST /api/ide/v1/get_detail_param`（`config_name` 列表，动态下发）
 - 鉴权：`Cloud-IDE-JWT <accessToken>` + `X-Cloudide-Token` + `X-Uid` + `X-Machine-Id` / `X-Device-Id`
 - token 获取：`refreshToken` → `ExchangeToken`（轮换 refresh）→ `GetUserInfo`（uid）

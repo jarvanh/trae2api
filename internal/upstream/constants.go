@@ -22,6 +22,10 @@ const (
 	Function = "solo_agent"
 	// FunctionWorkLite 免费引流通道（无 max 档），保留作回滚取值。
 	FunctionWorkLite = "solo_work_lite"
+	// FunctionHasMaxTier 含 __max 档的默认通道（= Function）。
+	// 2026-10-26 实测：solo_agent / chat_v3 的 get_detail_param 带 __max 档，
+	// solo_work_lite 无。FunctionSupportsMaxTier 以此为准。
+	FunctionHasMaxTier = "solo_agent"
 
 	// 端点
 	EpChat          = "/api/agent/v3/llm_utils_chat"

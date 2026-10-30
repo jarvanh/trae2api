@@ -156,6 +156,7 @@ curl -X POST http://127.0.0.1:7864/v1/chat/completions \
 | `TW2A_CALLBACK_PORT` | `18080` | 本地 OAuth 回调端口（设为 0 可关闭） |
 | `TW2A_TIMEOUT_SECONDS` | `120` | 上游请求超时时长（秒） |
 | `TW2A_FUNCTION` | `solo_agent` | 上游 function 通道；填 `solo_work_lite` 可回滚旧免费通道（无 max 档，上下文上限 200K） |
+| `TW2A_MAX_TIER_MODE` | `auto` | 裸名请求档位策略：`auto` = 目录确认含 `__max` 档即升级（1M 窗口）；`dev` = 全保持 dev 档。显式 `<model>__max`/`__dev` 点名不受影响（config.json 键 `upstream.max_tier_mode`） |
 | `TW2A_REFRESH_SKEW` | `72h` | token 预刷新窗口：到期前多久开始自动续期（config.json 键 `schedule.refresh_skew`） |
 | `TW2A_ERR_THRESHOLD` | `3` | 触发冷却前的连续错误次数 |
 | `TW2A_ERR_COOLDOWN` | `10m` | 错误冷却时长（duration 字符串，如 `10m` / `600s`） |
@@ -168,12 +169,21 @@ curl -X POST http://127.0.0.1:7864/v1/chat/completions \
 
 | function | 可见配置数 | `glm-5.3` 能力 | 说明 |
 |---|---|---|---|
-| `solo_agent`（默认） | 69（41 可见） | **1M / 936K 输入 / 64K 输出** | 带 `__dev`/`__max` 双档，裸 `config_name` 即可命中 max 档 |
+| `solo_agent`（默认） | 69（41 可见） | **1M / 936K 输入 / 64K 输出** | 带 `__dev`/`__max` 双档；2026-10-30 起请求默认改写 `<model>__max` + `extra_info.v2_max_mode_enabled`（10-26 实测 200 配方，见下） |
 | `solo_work_lite` | 48 | 200K / 168K 输入 / 32K 输出 | 免费引流通道，无 max 档 |
 | `chat_v3` | 59 | dev 档仅 116K | IDE 对话通道 |
 
 `/v1/models` 只列 `is_invisible_to_user=false` 的面向用户配置；invisible 的内部配置
 （`*_auto` / `*_subagent` / `title_generation` 等）仍可直接请求（实测部分可用），不参与展示。
+
+### max 档请求改写（2026-10-30）
+
+10-26 实测唯一拿到 200 的配方是**三件套**：`function=solo_agent` + `model=<model>__max`
++ `extra_info.v2_max_mode_enabled=true`（930K 输入 HEAD/TAIL 双针召回）；只加开关不改名
+被 dev 档 4022 拒。因此网关默认（`max_tier_mode=auto`）在目录确认该模型含 `__max` 档时
+自动注入上述改写；`dev` 策略或目录无档时保持裸名 dev 档。显式点名 `<model>__max` 但目录
+无档 → 400（静默降级会把超 200K 请求烧成上游 4022）。SOLO 1005 回退 Work 通道前自动剥离
+改写（Work 无档位概念）。
 
 ## 安全声明
 

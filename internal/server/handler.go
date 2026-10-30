@@ -23,22 +23,25 @@ import (
 
 // Config handler 依赖。
 type Config struct {
-	Pool            *pool.Pool
-	Upstream        *upstream.Client
-	WorkClient      *upstream.WorkClient
-	WorkMode        upstream.WorkMode
-	APIKey          string        // 空 = 不鉴权
-	AuthDir         string        // auths/ 目录，用于 import/delete 落盘 trae-*.json
-	UsageDir        string        // 用量明细目录（/app/data），空 = 不落盘
-	MaxRotate       int           // 单请求最多换号次数，默认 3
-	PlanCooldown    time.Duration // 1005 冷却，默认 12h
-	SoftCooldown    time.Duration // 429 冷却，默认 60s
-	ErrThreshold    int           // 连续错误阈值，默认 3
-	ErrCooldown     time.Duration // 错误冷却，默认 10m
-	RefreshSkew     time.Duration // token 预刷新窗口，默认 72h（schedule.refresh_skew 可配）
-	DefaultModel    string        // 默认 glm-5.2
-	WorkBridgeURL   string        // 本地 Work 积分桥接端点，如 http://127.0.0.1:7865
-	WorkBridgeToken string        // 访问 WorkBridge 的 Bearer token（空 = 不带鉴权）
+	Pool         *pool.Pool
+	Upstream     *upstream.Client
+	WorkClient   *upstream.WorkClient
+	WorkMode     upstream.WorkMode
+	APIKey       string        // 空 = 不鉴权
+	AuthDir      string        // auths/ 目录，用于 import/delete 落盘 trae-*.json
+	UsageDir     string        // 用量明细目录（/app/data），空 = 不落盘
+	MaxRotate    int           // 单请求最多换号次数，默认 3
+	PlanCooldown time.Duration // 1005 冷却，默认 12h
+	SoftCooldown time.Duration // 429 冷却，默认 60s
+	ErrThreshold int           // 连续错误阈值，默认 3
+	ErrCooldown  time.Duration // 错误冷却，默认 10m
+	RefreshSkew  time.Duration // token 预刷新窗口，默认 72h（schedule.refresh_skew 可配）
+	DefaultModel string        // 默认 glm-5.2
+	// MaxTierMode 裸名请求的档位策略："auto"（默认，目录含 __max 档即升级）
+	// | "dev"（全保持 dev 档，回滚开关）。显式 <model>__max / __dev 点名不受影响。
+	MaxTierMode     string
+	WorkBridgeURL   string // 本地 Work 积分桥接端点，如 http://127.0.0.1:7865
+	WorkBridgeToken string // 访问 WorkBridge 的 Bearer token（空 = 不带鉴权）
 	// Keepalive 流式响应在「首个真实帧到达前」的心跳间隔（SSE 注释帧 `: ping`）。
 	// <=0 = 不发心跳（cmd/server 载入配置时未设/0 已归一化为默认 15s，负数才是显式关闭）。用于防止边缘网关因长排队窗口连接静默而提前掐断（502）。
 	Keepalive time.Duration
@@ -80,6 +83,9 @@ func NewHandler(cfg Config) *Handler {
 	}
 	if cfg.DefaultModel == "" {
 		cfg.DefaultModel = upstream.DefaultConfigName
+	}
+	if cfg.MaxTierMode == "" {
+		cfg.MaxTierMode = MaxTierModeAuto
 	}
 	if cfg.WorkClient == nil {
 		workCfg := upstream.DefaultWorkClientConfig()
@@ -230,6 +236,57 @@ func (h *Handler) mapModel(model string) (string, error) {
 		return model, nil
 	}
 	return "", fmt.Errorf("unknown model %q", model)
+}
+
+// 裸名档位策略（max_tier_mode / TW2A_MAX_TIER_MODE）：auto（默认）= 目录确认
+// 带 __max 档即升级；dev = 全保持 dev 档（回滚开关）。
+const (
+	MaxTierModeAuto = "auto"
+	MaxTierModeDev  = "dev"
+)
+
+// maxTier auto 策略下允许裸名升级 max 档；dev 策略一律保持 dev 档。
+func (h *Handler) maxTier() bool { return h.cfg.MaxTierMode != MaxTierModeDev }
+
+// resolveModelTier 把 mapModel 的 config_name 与客户端原始 model 归并成
+// (config, 最终档位)。裸名在 auto 策略 + 目录确认带 __max 档时升级 TierMax；
+// 显式 __max / __dev 点名锁定档位，点名的 __max 还要过目录确认（HasMaxTier）
+// —— 上游对不存在的 <model>__max 直接 4001 param is invalid，不能只信名字。
+// 点名 max 但目录说没档 → 报错让调用方 400：静默降级 dev 会把超 200K 的请求
+// 烧成上游 4022。Work 通道（native/bridge）没有档位概念，一律返回 dev。
+func (h *Handler) resolveModelTier(config, rawModel string) (string, upstream.ModelTier, error) {
+	raw := strings.TrimSpace(rawModel)
+	// Work 通道没有 __max 档概念，max 改写只属于 SOLO 通道。
+	if isWorkModel(raw) || isWorkModel(config) {
+		return config, upstream.TierDev, nil
+	}
+	if strings.HasSuffix(raw, upstream.MaxTierSuffix) {
+		if !h.maxTier() || !h.modelHasMaxTier(config) {
+			return config, upstream.TierDev, fmt.Errorf("model %q has no __max tier on this channel (or max_mode disabled); use the bare model name", raw)
+		}
+		return config, upstream.TierMax, nil
+	}
+	if strings.HasSuffix(raw, upstream.DevTierSuffix) {
+		return config, upstream.TierDev, nil
+	}
+	// 裸名升级前再核通道：目录按当前 function 拉，正常已隐含通道能力，
+	// 这里防「目录缓存与通道配置错位」的窗口（回滚 solo_work_lite 后旧缓存未过期）。
+	fnSupportsMax := h.cfg.Upstream == nil || h.cfg.Upstream.FunctionSupportsMaxTier()
+	if h.maxTier() && fnSupportsMax && h.modelHasMaxTier(config) {
+		return config, upstream.TierMax, nil
+	}
+	return config, upstream.TierDev, nil
+}
+
+// modelHasMaxTier 查动态目录确认 config 带 __max 档；目录不可用时回退
+// 静态表语义 = 未知，按 false 处理（不改写，保底可跑 dev 档）。
+func (h *Handler) modelHasMaxTier(config string) bool {
+	for _, mi := range h.fetchDynamicModels() {
+		if mi.ID == config {
+			return mi.HasMaxTier
+		}
+	}
+	return false
 }
 
 // normalizeModelName 将下划线命名的内部名归一化为 config_name 风格（横线分隔）。
@@ -824,6 +881,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	body = setModelInBody(body, configName)
 
+	// 档位解析（2026-10-30）：裸名按 max_tier_mode 策略升级 max 档（auto 时
+	// 目录含 __max 即升级，对应 solo_agent 的 1M/936K/64K）；显式 __max/__dev
+	// 点名由 resolveModelTier 校验目录，点名档不存在直接 400 —— 静默降级 dev
+	// 会把超 200K 的请求烧成上游 4022。
+	_, tier, err := h.resolveModelTier(configName, peek.Model)
+	if err != nil {
+		st.status = http.StatusBadRequest
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	if tier == upstream.TierMax {
+		body = upstream.SetMaxTierMode(body)
+	}
+
 	// 若显式请求 Work 模型（且未携带外部自定义 tools），走 Work 通道多账号动态调度（带会话粘性，消费 work_credits）
 	if isWorkModel(peek.Model) && !hasTools {
 		if h.cfg.WorkMode == upstream.WorkModeDisabled || (h.cfg.WorkClient != nil && h.cfg.WorkClient.Mode() == upstream.WorkModeDisabled) {
@@ -938,7 +1009,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 				h.cfg.Pool.Cooldown(acct.UID, pool.CoolPlan, h.cfg.PlanCooldown, "plan 权益不足")
 				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
-				if handled, _ := h.executeWorkRequest(w, r, body, configName, peek.Stream, sessionKey, st); handled {
+				// 回退 Work 前剥离 max 档改写：Work 通道无档位概念，
+				// bridge 模式透传原始 body，__max 名/max 开关可能被桥接端误消费。
+				fbBody := body
+				if tier == upstream.TierMax {
+					fbBody = upstream.StripMaxTierMode(body)
+				}
+				if handled, _ := h.executeWorkRequest(w, r, fbBody, configName, peek.Stream, sessionKey, st); handled {
 					st.status = http.StatusOK
 					return
 				}
