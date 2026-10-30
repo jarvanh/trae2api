@@ -1188,8 +1188,8 @@ func TestChatPlanGateBlocksModelNotAccount(t *testing.T) {
 }
 
 // 2026-10-30 主人需求：裸名请求在 auto 策略 + 目录确认含 __max 档时默认升级 max 档。
-// 请求体必须同时含 model/config_name=<config>__max 与 extra_info.v2_max_mode_enabled=true
-// （10-26 实测配方，缺一都被 dev 档 4022 拒）。
+// 请求体必须 model=<config>__max（config_name 保持裸名，带后缀 4001）且
+// extra_info.v2_max_mode_enabled=true（10-26 实测配方，大输入下缺一都被 4022 拒）。
 func TestChatBareModelAutoUpgradesToMaxTier(t *testing.T) {
 	resetModelCache(t)
 	var chatBody []byte
@@ -1220,8 +1220,8 @@ func TestChatBareModelAutoUpgradesToMaxTier(t *testing.T) {
 	if err := json.Unmarshal(chatBody, &body); err != nil {
 		t.Fatalf("chat body not json: %v", err)
 	}
-	if body["config_name"] != "glm-5.3__max" || body["model"] != "glm-5.3__max" {
-		t.Errorf("裸名应升级 __max: config_name=%v model=%v", body["config_name"], body["model"])
+	if body["config_name"] != "glm-5.3" || body["model"] != "glm-5.3__max" {
+		t.Errorf("config_name 应保持裸名、model 应升级 __max: config_name=%v model=%v", body["config_name"], body["model"])
 	}
 	extra, ok := body["extra_info"].(map[string]any)
 	if !ok || extra["v2_max_mode_enabled"] != true {

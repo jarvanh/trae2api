@@ -1,9 +1,10 @@
 // tier.go SOLO 请求档位（__dev/__max）解析与请求体改写。
 // 2026-10-26 实测（memory/2026-10-26.md:136-147）：solo_agent 通道下
 // 930K 输入 + model=glm-5.3__max + extra_info.v2_max_mode_enabled=true → 200，
-// HEAD/TAIL 双针正确召回（1M 总窗口实证）。
-// 裸名或仅 extra_info 开关都被 dev 档 4022 prompt tokens exceeded 拒，
-// 因此改写时两者必须成对注入 —— 见 SetMaxTierMode。
+// HEAD/TAIL 双针正确召回（1M 总窗口实证）；裸名或仅开关都被 dev 档 4022 拒。
+// 2026-10-30 直连矩阵补测：config_name 必须保持裸名 —— 带 __max 后缀上游直接
+// 4001 param is invalid（config_name 是目录身份，档位后缀只允许出现在 model
+// 字段），故本文件只改写 model，config_name 交由 PrepareBody 归一化（恒裸名）。
 package upstream
 
 import (
@@ -17,7 +18,8 @@ type ModelTier int
 const (
 	// TierDev dev 档：裸 config_name 的默认档（glm-5.3 = 200K/168K/32K）。
 	TierDev ModelTier = iota
-	// TierMax max 档：config_name=<model>__max + max 模式开关（glm-5.3 = 1M/936K/64K）。
+	// TierMax max 档：model=<model>__max + max 模式开关（glm-5.3 = 1M/936K/64K；
+	// config_name 保持裸名，2026-10-30 矩阵实测）。
 	TierMax
 )
 
@@ -29,7 +31,7 @@ const (
 
 // maxModeExtraInfoKey / maxModeField 启用 max 模式的 extra_info 字段。
 // 字段别名经 dsh-connect-trae / pi-connect / cli2api 同类项目互证，
-// 并由 2026-10-26 实测确认（仅加开关不加 __max 仍被 dev 档 4022 拒）。
+// 并由 2026-10-26 实测确认（大输入下仅加开关不加 __max 仍被 dev 档 4022 拒）。
 const (
 	maxModeExtraInfoKey = "extra_info"
 	maxModeField        = "v2_max_mode_enabled"
@@ -45,12 +47,14 @@ func MaxTierModelName(config string) string {
 
 // SetMaxTierMode 把请求体改写为 max 档：
 //
-//	model + config_name → <config>__max
+//	model → <model>__max（config_name 不动，由 PrepareBody 归一化为裸名）
 //	extra_info.v2_max_mode_enabled = true
 //
-// 与 10-26 实测成功样本逐字段对齐：只改 model 不加开关、或只加开关不改名，
-// 都会被 dev 档 4022 拒。config_name/model 都缺省时按 DefaultConfigName 兜底
-// （与 PrepareBody 的缺省口径一致）。无法解析时原样返回。
+// 2026-10-30 直连矩阵实测：config_name 带 __max 后缀 → 上游 4001 param is
+// invalid；config_name 裸名 + model=__max → 200。大输入下 model=__max 与开关
+// 缺一都被 dev 档 4022 拒（10-26 实测），故两者成对注入。model 缺省时依次回退
+// config_name、DefaultConfigName（与 PrepareBody 的缺省口径一致）。
+// 无法解析时原样返回。
 func SetMaxTierMode(src []byte) []byte {
 	if len(src) == 0 {
 		return src
@@ -60,15 +64,14 @@ func SetMaxTierMode(src []byte) []byte {
 		return src
 	}
 	maxName := ""
-	if cur, ok := obj["config_name"].(string); ok && strings.TrimSpace(cur) != "" {
+	if cur, ok := obj["model"].(string); ok && strings.TrimSpace(cur) != "" {
 		maxName = MaxTierModelName(strings.TrimSpace(cur))
-	} else if cur, ok := obj["model"].(string); ok && strings.TrimSpace(cur) != "" {
+	} else if cur, ok := obj["config_name"].(string); ok && strings.TrimSpace(cur) != "" {
 		maxName = MaxTierModelName(strings.TrimSpace(cur))
 	}
 	if maxName == "" {
 		maxName = MaxTierModelName(DefaultConfigName)
 	}
-	obj["config_name"] = maxName
 	obj["model"] = maxName
 
 	extra, _ := obj[maxModeExtraInfoKey].(map[string]any)
@@ -85,10 +88,10 @@ func SetMaxTierMode(src []byte) []byte {
 	return out
 }
 
-// StripMaxTierMode 撤销 SetMaxTierMode：model/config_name 去掉 __max 后缀，
-// 删除 extra_info.v2_max_mode_enabled。SOLO→Work 回退路径用 —— Work 通道
-// 没有档位概念，bridge 模式透传原始 body，改写残留可能被桥接端误消费。
-// 无法解析时原样返回。
+// StripMaxTierMode 撤销 SetMaxTierMode：model 去掉 __max 后缀（config_name
+// 一并剥后缀兜底，正常本就是裸名），删除 extra_info.v2_max_mode_enabled。
+// SOLO→Work 回退路径用 —— Work 通道没有档位概念，bridge 模式透传原始 body，
+// 改写残留可能被桥接端误消费。无法解析时原样返回。
 func StripMaxTierMode(src []byte) []byte {
 	if len(src) == 0 {
 		return src

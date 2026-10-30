@@ -97,7 +97,9 @@ func PrepareBodyFunction(src []byte, function string) []byte {
 	if model == "" {
 		model = DefaultConfigName
 	}
-	obj["config_name"] = model
+	// config_name 恒为裸 config 身份（2026-10-30 直连矩阵实测：config_name
+	// 带 __max 后缀 → 上游 4001 param is invalid；档位后缀只允许在 model 字段）。
+	obj["config_name"] = strings.TrimSuffix(model, MaxTierSuffix)
 	obj["model"] = model
 
 	normalizeToolChoice(obj)
