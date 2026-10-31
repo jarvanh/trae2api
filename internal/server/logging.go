@@ -28,9 +28,19 @@ type chatStat struct {
 	ttfb   time.Duration
 	toks   int // <0 表示 usage 缺失 → 显示 "-"
 	status int
+	// maxTier 本次实际发往上游的请求是否为 max 档（按账号注入，可能随轮换
+	// 从 max 降回 dev）。排障键：4022/4001 档位错误时一眼看出请求走哪一档。
+	maxTier bool
 
 	logged      bool
 	usageLogged bool // 本次请求已在成功路径落过用量账（避免失败兜底重复写一行）
+}
+
+// setMaxTier 标记本次尝试实际使用的档位；每轮选号后调用，后写覆盖先写。
+func (s *chatStat) setMaxTier(v bool) {
+	if s != nil {
+		s.maxTier = v
+	}
 }
 
 // newChatStat 以请求进入 handler 的时刻为起点构造统计对象；toks 默认 -1（usage 缺失）。
@@ -48,7 +58,7 @@ func (s *chatStat) done() {
 		return
 	}
 	s.logged = true
-	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks)
+	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks, s.maxTier)
 }
 
 // msSince 返回从 s.start 到现在的耗时（毫秒）。
@@ -69,6 +79,9 @@ func msSince(s *chatStat) int64 {
 func noteUsage(s *chatStat, rec usageRecord) {
 	if s != nil {
 		s.usageLogged = true
+		// max 档标记统一在这里注入：成功路径与失败兜底共用 st.maxTier，
+		// 各 noteUsage 调用点不必逐个传（Work 路径 st.maxTier 已被清除）。
+		rec.Max = s.maxTier
 	}
 	recordUsage(rec)
 }
@@ -96,15 +109,9 @@ func (h *Handler) recordFailure(r *http.Request, st *chatStat, lastErr error) {
 		errMsg = lastErr.Error()
 	}
 	recordUsage(usageRecord{
-		Dir:    h.cfg.UsageDir,
-		Model:  st.model,
-		Probe:  isProbeRequest(r),
-		UID:    st.uid,
-		Status: status,
-		Mode:   st.mode,
-		Ms:     msSince(st),
-		TTFB:   st.ttfb.Milliseconds(),
-		Err:    errMsg,
+		Dir: h.cfg.UsageDir, Model: st.model, Probe: isProbeRequest(r), UID: st.uid,
+		Status: status, Mode: st.mode, Max: st.maxTier,
+		Ms: msSince(st), TTFB: st.ttfb.Milliseconds(), Err: errMsg,
 	})
 }
 
@@ -255,7 +262,8 @@ func uidPrefix(uid string) string {
 }
 
 // logChatRow 打印一行请求级表格日志（直接输出 stdout，无 log 时间戳前缀）。
-func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks int) {
+// maxTier=true 时 mode 后缀 *（如 stream*）：本次尝试走 max 档。
+func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks int, maxTier bool) {
 	if !chatLogEnabled {
 		return
 	}
@@ -276,6 +284,9 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 	ttfbMS := "-"
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
+	}
+	if maxTier {
+		mode += "*"
 	}
 	fmt.Fprintf(os.Stdout, "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | total=%.1fs |\n",
 		seq,

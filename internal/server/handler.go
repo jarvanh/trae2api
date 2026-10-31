@@ -272,7 +272,12 @@ func (h *Handler) resolveModelTier(config, rawModel string) (string, upstream.Mo
 	// 裸名升级前再核通道：目录按当前 function 拉，正常已隐含通道能力，
 	// 这里防「目录缓存与通道配置错位」的窗口（回滚 solo_work_lite 后旧缓存未过期）。
 	fnSupportsMax := h.cfg.Upstream == nil || h.cfg.Upstream.FunctionSupportsMaxTier()
-	if h.maxTier() && fnSupportsMax && h.modelHasMaxTier(config) {
+	// max 权益预门控（2026-10-31，借鉴 autumnsentiment/Trae2api-cn）：auto 升级
+	// 还要求池里确有账号带该 __max 档权益（各号 get_detail_param 档位表）。
+	// 全池无权益时升级必然全号 4022，直接保持 dev 档；数据未探测（冷启动/
+	// 目录拉取失败）时 MaxServed 放行 —— 过滤是优化不是闸门，与 ModelKnown
+	// 同一纪律。显式点名的 __max 不走此门控，保留「目录无档 → 400」的响亮失败。
+	if h.maxTier() && fnSupportsMax && h.modelHasMaxTier(config) && h.cfg.Pool.MaxServed(config) {
 		return config, upstream.TierMax, nil
 	}
 	return config, upstream.TierDev, nil
@@ -571,13 +576,19 @@ func (h *Handler) refreshModelIntersection() []upstream.ModelInfo {
 			if err != nil || len(infos) == 0 {
 				// 显式清能力集：宁可回到「不限制」，也别拿上一轮老数据继续卡选号。
 				h.cfg.Pool.SetModels(a.UID, nil)
+				h.cfg.Pool.SetMaxModels(a.UID, nil)
 				return
 			}
 			ids := make([]string, 0, len(infos))
+			maxIDs := make([]string, 0)
 			for _, mi := range infos {
 				ids = append(ids, mi.ID)
+				if mi.HasMaxTier {
+					maxIDs = append(maxIDs, mi.ID)
+				}
 			}
 			h.cfg.Pool.SetModels(a.UID, ids)
+			h.cfg.Pool.SetMaxModels(a.UID, maxIDs)
 			results[i] = &infos
 		}(i, a)
 	}
@@ -631,6 +642,9 @@ func (h *Handler) refreshModelIntersection() []upstream.ModelInfo {
 			if mi.MaxTokens > 0 && (cur.MaxTokens == 0 || mi.MaxTokens < cur.MaxTokens) {
 				cur.MaxTokens = mi.MaxTokens
 			}
+			// HasMaxTier 取 OR：档位表按号下发，任一号报告 __max 档即视为存在
+			//（与 PerMaxModels 的逐号权益集配合：目录确认存在性，选号确认账号权益）。
+			cur.HasMaxTier = cur.HasMaxTier || mi.HasMaxTier
 			if cur.Name == "" {
 				cur.Name = mi.Name
 			}
@@ -732,6 +746,8 @@ func (h *Handler) executeWorkRequest(w http.ResponseWriter, r *http.Request, bod
 	if h.cfg.WorkMode == upstream.WorkModeDisabled || (h.cfg.WorkClient != nil && h.cfg.WorkClient.Mode() == upstream.WorkModeDisabled) {
 		return false, errors.New("work channel is disabled by configuration (TW2A_WORK_MODE=disabled)")
 	}
+	// Work 通道无档位概念：进入即清 max 标记，用量账不把 Work 请求记成 max。
+	st.setMaxTier(false)
 
 	workBody := body
 	if !isWorkModel(model) {
@@ -891,8 +907,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	if tier == upstream.TierMax {
-		body = upstream.SetMaxTierMode(body)
+	// max 权益预门控双保险：resolveModelTier 已过 MaxServed，这里兜底防
+	// 目录缓存与权益数据的时序漂移。档位改写不再提前打在 body 上，下沉到
+	// 选号循环按账号注入 —— max 权益按账号下发，同一请求对不同号可能一
+	// max 一 dev。
+	if tier == upstream.TierMax && h.cfg.Pool != nil && !h.cfg.Pool.MaxServed(configName) {
+		tier = upstream.TierDev
 	}
 
 	// 若显式请求 Work 模型（且未携带外部自定义 tools），走 Work 通道多账号动态调度（带会话粘性，消费 work_credits）
@@ -950,13 +970,46 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 注意：换模型会重绑 sessionKey（绑定账号没这能力时按能力重选），
 		// 牺牲一点 KV cache 命中率换路由正确性 —— 后者更重要。
-		acct := h.cfg.Pool.PickAffinityForModel(sessionKey, tried, capFilter)
+		// wantMax 时额外叠加 __max 权益过滤（PickAffinityForTier）：无权益号
+		// 提前出局，不靠请求打出去吃 4022 才发现（2026-10-31）。
+		wantMax := tier == upstream.TierMax
+		var acct *auth.Auth
+		if wantMax {
+			acct = h.cfg.Pool.PickAffinityForTier(sessionKey, tried, capFilter, true)
+		} else {
+			acct = h.cfg.Pool.PickAffinityForModel(sessionKey, tried, capFilter)
+		}
+		if acct == nil && wantMax {
+			// 已无账号可承接 __max 档（权益缺失或刚被运行时拉黑）：整请求
+			// 降回 dev 档并在同一轮内重选 —— 降级本身不消耗轮换预算，否则
+			// max 尝试用完 MaxRotate 后 dev 兑底永远轮不到。
+			// 同时清 tried：已试账号的失败要么是 max 专属（已进 maxBlocks）、
+			// 要么已进冷却/禁用，dev 重试不受影响。显式点名的请求同样降级：
+			// 目录有档但账号无权益时，降档好过必败。
+			tier = upstream.TierDev
+			tried = map[string]bool{}
+			wantMax = false
+			acct = h.cfg.Pool.PickAffinityForModel(sessionKey, tried, capFilter)
+		}
 		if acct == nil {
 			break
 		}
 		tried[acct.UID] = true
 		acquireAcct(acct.UID)
 		st.uid = acct.UID
+
+		// 档位改写按账号注入（2026-10-31）：MaxServed 只保证「池里有人有权益」，
+		// 具体到本次选中的号还要再核一遍（含运行时拉黑）；无权益号剥成 dev 请求，
+		// 不让它吃 4022。body 恒为未改写基底，Work 回退可直接透传。
+		attemptBody := body
+		curTier := tier
+		if wantMax && !h.cfg.Pool.AccountMaxEntitled(acct.UID, configName) {
+			curTier = upstream.TierDev
+		}
+		if curTier == upstream.TierMax {
+			attemptBody = upstream.SetMaxTierMode(body)
+		}
+		st.setMaxTier(curTier == upstream.TierMax)
 
 		// token 临近过期 → 先 refresh（持锁重查，避免并发重复轮换；失败冷却换号）
 		refreshed, err := h.cfg.Upstream.RefreshTokenIfNeeded(acct, h.cfg.RefreshSkew)
@@ -977,7 +1030,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		// 接 r.Context()：客户端断连（含 Cloudflare 100s 524 掐断）立即取消上游，
 		// 避免下游放弃后上游仍空烧算力（拥堵窗口的主要放大器之一）。
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(r.Context(), acct, body)
+		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(r.Context(), acct, attemptBody)
 		if terr != nil {
 			lastErr = terr
 			h.cfg.Pool.RecordError(acct.UID)
@@ -1009,13 +1062,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 				h.cfg.Pool.Cooldown(acct.UID, pool.CoolPlan, h.cfg.PlanCooldown, "plan 权益不足")
 				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
-				// 回退 Work 前剥离 max 档改写：Work 通道无档位概念，
-				// bridge 模式透传原始 body，__max 名/max 开关可能被桥接端误消费。
-				fbBody := body
-				if tier == upstream.TierMax {
-					fbBody = upstream.StripMaxTierMode(body)
-				}
-				if handled, _ := h.executeWorkRequest(w, r, fbBody, configName, peek.Stream, sessionKey, st); handled {
+				// 回退 Work：body 是未经档位改写的基底（max 改写按次注入 attemptBody），
+				// Work 通道无档位概念，直接透传即可。
+				if handled, _ := h.executeWorkRequest(w, r, body, configName, peek.Stream, sessionKey, st); handled {
 					st.status = http.StatusOK
 					return
 				}
@@ -1038,6 +1087,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 换号必然复现，还会把整池打冷却（2026-10-27 实弹：free/pro/flash/
 				// claude-opus-5 在目录里有、对话上游不认，3 号轮转后 2 个号进冷却）。
 				// 立即透传给调用方，不冷却、不计错、不轮换。
+				//
+				// max 档例外（2026-10-31）：4022/4001 档位权益错误按账号下发
+				//（同类项目 wangqi233/trae2api 实证：无 entitlement 账号报 4001），
+				// 换号可能解决 —— 拉黑该号的 __max 档并轮换；池内无其余权益号时
+				// 由循环的降级路径回 dev 重试。
+				if curTier == upstream.TierMax {
+					h.cfg.Pool.BlockMaxModel(acct.UID, configName)
+					lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+					continue
+				}
 				st.status = status
 				writeOpenAIError(w, http.StatusBadRequest, "invalid_param",
 					"upstream rejected model/param (account-independent): "+string(respBody))
@@ -1065,7 +1124,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 流内业务错误（1005 plan/5xx 等）→ 冷却账号，错误信息注入 SSE。
 			// Keepalive > 0 时在首帧到达前发 `: ping` 注释帧，防边缘网关静默掐断（502）。
 			_ = upstream.StreamWithUsageKeepalive(w, statsR, func(se *upstream.SOLOStreamError) {
-				h.handleStreamError(acct.UID, configName, se)
+				h.handleStreamError(acct.UID, configName, se, curTier == upstream.TierMax)
 			}, func(remain float64) {
 				// 流内记账（2026-10-16 定案）：notify_usage 账单事件 → 本地包账本
 				// FIFO 扣减。零额外上游请求，扣费后余额实时进 pool。
@@ -1094,6 +1153,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if errors.As(err, &se) {
 				lastErr = err
 				if se.Kind() == upstream.ErrClient {
+					// max 档的档位权益错误按账号下发：拉黑该号 __max 档并轮换
+					//（响应未开始写，可安全重试；见 status>=400 ErrClient 分支注释）。
+					if curTier == upstream.TierMax {
+						h.cfg.Pool.BlockMaxModel(acct.UID, configName)
+						continue
+					}
 					st.status = http.StatusBadRequest
 					writeOpenAIError(w, http.StatusBadRequest, "invalid_param",
 						"upstream rejected model/param (account-independent): "+se.Error())
@@ -1159,7 +1224,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 // handleStreamError 流式响应中的上游业务错误 → pool 冷却状态机。
 // 1005 / 4008 plan 权益不足 → 长冷却；4011 限流 → 短冷却；其余（5xx/参数错误等）→ 累计错误冷却。
-func (h *Handler) handleStreamError(uid, model string, se *upstream.SOLOStreamError) {
+func (h *Handler) handleStreamError(uid, model string, se *upstream.SOLOStreamError, wasMaxTier bool) {
 	switch se.Kind() {
 	case upstream.ErrPlanLimit:
 		// 1005 归因：账本有钱 = 模型级套餐门禁 → 拉黑 (号,模型)，不冷却账号
@@ -1173,6 +1238,12 @@ func (h *Handler) handleStreamError(uid, model string, se *upstream.SOLOStreamEr
 	case upstream.ErrSoftRate:
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit")
 	default:
+		// max 档流内 4xx（4022/4001 档位权益错误）按账号下发：只拉黑该号
+		// 的 __max 档，dev 档照常可用（与响应层 ErrClient 处置同口径）。
+		if wasMaxTier {
+			h.cfg.Pool.BlockMaxModel(uid, model)
+			return
+		}
 		h.cfg.Pool.NoteError(uid, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
 	}
 }

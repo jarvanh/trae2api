@@ -176,14 +176,27 @@ curl -X POST http://127.0.0.1:7864/v1/chat/completions \
 `/v1/models` 只列 `is_invisible_to_user=false` 的面向用户配置；invisible 的内部配置
 （`*_auto` / `*_subagent` / `title_generation` 等）仍可直接请求（实测部分可用），不参与展示。
 
-### max 档请求改写（2026-10-30）
+### max 档请求改写（2026-10-30，10-31 增加权益预门控）
 
 10-26 实测唯一拿到 200 的配方是**三件套**：`function=solo_agent` + `model=<model>__max`
 + `extra_info.v2_max_mode_enabled=true`（930K 输入 HEAD/TAIL 双针召回）；只加开关不改名
 被 dev 档 4022 拒。因此网关默认（`max_tier_mode=auto`）在目录确认该模型含 `__max` 档时
 自动注入上述改写；`dev` 策略或目录无档时保持裸名 dev 档。显式点名 `<model>__max` 但目录
-无档 → 400（静默降级会把超 200K 请求烧成上游 4022）。SOLO 1005 回退 Work 通道前自动剥离
-改写（Work 无档位概念）。
+无档 → 400（静默降级会把超 200K 请求烧成上游 4022）。
+
+**权益预门控（2026-10-31，借鉴 autumnsentiment/Trae2api-cn + wangqi233/trae2api）**：
+`__max` 档按账号权益下发（同类项目实证：无 entitlement 账号打 max 请求直接报 4001），
+目录刷新会同时记录每号的 `__max` 档集合：
+
+- **选号过滤**：max 请求只在权益号里选/绑定（`PickAffinityForTier`），无权益号提前出局；
+- **池级门控**：全部已探测号都无 `__max` 档时裸名升级整体降回 dev（升级了也必然全号 4022）；
+  任一号未探测则放行（过滤是优化不是闸门，与能力过滤同一纪律）；
+- **按号注入**：档位改写不再提前打在 body 上，选号后逐号注入 —— 池内一 max 一 dev 时
+  各发各的档，Work 回退直接透传未改写基底（原 `StripMaxTierMode` 剥离环节已随之删除）；
+- **运行时拉黑**：max 请求吃 4001/4022 → 拉黑该号的 `__max` 档（TTL 1h 自愈，dev 档
+  照常可用，不冷却不禁用），max 候选耗尽后同轮降回 dev 重试，不消耗轮换预算；
+- **可观测**：表格日志 mode 后缀 `*`（如 `sync*`）= 本次尝试走 max 档；用量流水
+  `"max":true` 同义。
 
 ## 安全声明
 

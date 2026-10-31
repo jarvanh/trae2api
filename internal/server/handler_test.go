@@ -1028,8 +1028,12 @@ func TestModelListHidesInternalConfigs(t *testing.T) {
 }
 
 // TestChatInvalidParamDoesNotRotate 覆盖 2026-10-27 实弹事故：目录里有但上游
-// 对话不认的模型（free/pro/flash）回 4001 invalid param，这是账号无关的 4xx ——
-// 换号必然复现，还会把整池打冷却。必须立即透传 400，不冷却、不计错、不轮换。
+// 对话不认的模型（free/pro/flash）回 4001 invalid param。
+// 2026-10-31 档位感知语义更新：裸名在 auto 策略下先按 max 档打（目录报告该
+// 模型带 __max 档）—— 4001/4022 档位权益错误按账号下发，先拉黑该号 __max
+// 档轮换其余号；max 候选耗尽后同轮降回 dev 再试，dev 仍 4001 才判定为账号
+// 无关错误立即透传 400（2 号池 = 2 次 max + 1 次 dev = 3 次调用）。全程不
+// 冷却不禁用：max 拉黑只封档位，dev 快速失败路径不伤账号。
 func TestChatInvalidParamDoesNotRotate(t *testing.T) {
 	var calls int32
 	// 目录端点正常返回（free 在并集表里），对话端点回 4001 invalid param ——
@@ -1070,8 +1074,10 @@ func TestChatInvalidParamDoesNotRotate(t *testing.T) {
 	h.ServeHTTP(rec, req)
 
 	t.Logf("calls=%d code=%d body=%s", atomic.LoadInt32(&calls), rec.Code, rec.Body.String())
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Fatalf("upstream called %d times, want 1 (account-independent 4xx must not rotate)", got)
+	// 2 号池：u1 max→4001（拉黑 u1 的 free max 档）→ u2 max→4001（拉黑 u2）→
+	// max 候选耗尽同轮降 dev → u1 dev→4001 → 账号无关错误快速失败，共 3 次。
+	if got := atomic.LoadInt32(&calls); got != 3 {
+		t.Fatalf("upstream called %d times, want 3 (2x max rotate + 1x dev fallback)", got)
 	}
 	if rec.Code != 400 {
 		t.Errorf("code=%d want 400, body=%s", rec.Code, rec.Body)
@@ -1341,5 +1347,126 @@ func TestChatWorkFallbackStripsMaxRewrite(t *testing.T) {
 	task := string(taskBody)
 	if strings.Contains(task, "__max") || strings.Contains(task, "v2_max_mode_enabled") {
 		t.Errorf("work 回退请求泄漏 max 改写: %s", task)
+	}
+}
+
+// devOnlyModelsJSON 单档目录：glm-5.3 只有裸档（无 __max），模拟无 max 权益
+// 账号的 get_detail_param 返回（档位表按账号下发）。
+func devOnlyModelsJSON(id string) string {
+	return `{"config_info_list":[{"config_name":"` + id + `","context_window_tokens":{"dev":200000},` +
+		`"model_detail_list":[{"model_name":"` + id + `","prompt_max_tokens":168000,"max_tokens":32000}]}]}`
+}
+
+// TestChatMaxTierSkipsUnentitledAccount 覆盖 2026-10-31 权益预门控：u1 目录
+// 报告无 __max 档、u2 有 —— 裸名请求升级 max 后必须跳过 u1 直接选 u2，
+// 无权益号不打上游（宁可选号时出局，也不让它吃 4022）。
+func TestChatMaxTierSkipsUnentitledAccount(t *testing.T) {
+	resetModelCache(t)
+	calls := map[string]int{}
+	var chatBody []byte
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, upstream.EpModels) {
+				body := devOnlyModelsJSON("glm-5.3")
+				if r.Header.Get("Authorization") == "Cloud-IDE-JWT at2" {
+					body = modelsJSON("glm-5.3")
+				}
+				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}},
+					Body: io.NopCloser(strings.NewReader(body))}, nil
+			}
+			calls[r.Header.Get("Authorization")]++
+			chatBody, _ = io.ReadAll(r.Body)
+			return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: io.NopCloser(strings.NewReader(soloSSE))}, nil
+		})},
+		AgentHost: "https://fake.example", UgHost: "https://fake.example",
+		OAuthHost: "https://fake.example", ClientID: upstream.ClientID,
+	}
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up, WorkMode: upstream.WorkModeDisabled})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.3","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if calls["Cloud-IDE-JWT at1"] != 0 {
+		t.Errorf("无权益号 u1 被打了 %d 次，应被选号过滤", calls["Cloud-IDE-JWT at1"])
+	}
+	if calls["Cloud-IDE-JWT at2"] != 1 {
+		t.Errorf("权益号 u2 调用=%d want 1", calls["Cloud-IDE-JWT at2"])
+	}
+	var body map[string]any
+	if err := json.Unmarshal(chatBody, &body); err != nil {
+		t.Fatalf("chat body not json: %v", err)
+	}
+	if body["model"] != "glm-5.3__max" {
+		t.Errorf("model=%v want glm-5.3__max", body["model"])
+	}
+}
+
+// TestChatMaxRuntimeBlockDowngradesToDev 覆盖运行时拉黑与降级链路：两号目录
+// 都报告 __max 档、但对话上游对 max 请求回 4001（权益与档位表不一致的实弹
+// 形态）—— 逐号拉黑 __max 档（不动账号本身），max 候选耗尽后同轮降回 dev
+// 重试成功。全程 3 次调用 = 2 次 max 轮换 + 1 次 dev 兑底。
+func TestChatMaxRuntimeBlockDowngradesToDev(t *testing.T) {
+	resetModelCache(t)
+	var calls int32
+	var lastBody []byte
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, upstream.EpModels) {
+				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}},
+					Body: io.NopCloser(strings.NewReader(modelsJSON("glm-5.3")))}, nil
+			}
+			atomic.AddInt32(&calls, 1)
+			lastBody, _ = io.ReadAll(r.Body)
+			var peek struct {
+				Model string `json:"model"`
+			}
+			_ = json.Unmarshal(lastBody, &peek)
+			if strings.HasSuffix(peek.Model, "__max") {
+				// max 请求吃 4001（权益按账号下发，档位表未如实反映）
+				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+					Body: io.NopCloser(strings.NewReader("event:error\ndata:{\"code\":4001,\"message\":\"the param is invalid\"}\n\n"))}, nil
+			}
+			return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: io.NopCloser(strings.NewReader(soloSSE))}, nil
+		})},
+		AgentHost: "https://fake.example", UgHost: "https://fake.example",
+		OAuthHost: "https://fake.example", ClientID: upstream.ClientID,
+	}
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up, WorkMode: upstream.WorkModeDisabled})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.3","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if got := atomic.LoadInt32(&calls); got != 3 {
+		t.Fatalf("calls=%d want 3 (2x max rotate + 1x dev fallback)", got)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(lastBody, &body); err != nil {
+		t.Fatalf("last chat body not json: %v", err)
+	}
+	if body["model"] != "glm-5.3" {
+		t.Errorf("兑底请求应为 dev 裸名, model=%v", body["model"])
+	}
+	if _, has := body["extra_info"]; has {
+		t.Errorf("dev 兑底请求不应带 extra_info 开关, got %v", body["extra_info"])
+	}
+	// 拉黑只封 __max 档：两号都仍健康可被 dev 选中
+	if got := p.Pick(); got == nil {
+		t.Fatal("max 拉黑不得冷却/禁用账号")
 	}
 }

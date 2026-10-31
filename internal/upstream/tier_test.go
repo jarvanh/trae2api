@@ -69,18 +69,6 @@ func TestSetMaxTierModeUnparseableReturnsSrc(t *testing.T) {
 	}
 }
 
-func TestStripMaxTierModeRoundTrip(t *testing.T) {
-	out := StripMaxTierMode(SetMaxTierMode([]byte(`{"config_name":"glm-5.3","model":"glm-5.3"}`)))
-	var obj map[string]any
-	_ = json.Unmarshal(out, &obj)
-	if obj["config_name"] != "glm-5.3" || obj["model"] != "glm-5.3" {
-		t.Errorf("strip 后 config_name/model = %v/%v", obj["config_name"], obj["model"])
-	}
-	if _, ok := obj["extra_info"]; ok {
-		t.Errorf("strip 后 extra_info 应删除, got %v", obj["extra_info"])
-	}
-}
-
 func TestMaxTierModelNameIdempotent(t *testing.T) {
 	if got := MaxTierModelName("glm-5.3__max"); got != "glm-5.3__max" {
 		t.Errorf("got %q", got)

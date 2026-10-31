@@ -111,6 +111,19 @@ type entry struct {
 	// 重启清零 + TTL 自愈，上游放开后自动恢复尝试。
 	modelBlocks map[string]time.Time
 
+	// maxModels 该账号实测带 __max 档的 config_name 集合（与 models 同源，
+	// 同一轮 get_detail_param 写入）。nil = 未探测：max 权益门控不生效（保守
+	// 放行）；非 nil（含空集）= 已探测，max 选号只认集合内的模型。max 档是
+	// 账号权益而非公共能力：上游按账号 entitlement 下发档位，无权益账号打
+	// max 请求直接被拒（同类项目 wangqi233/trae2api 注释实证：报 4001 param
+	// invalid）。请求侧不加过滤就会把 max 请求反复打到无权益号上空烧轮次。
+	// 只存内存，每轮目录刷新重建（理由同 models）。
+	maxModels map[string]bool
+	// maxBlocks (号,模型) 级 __max 档拉黑：该号对 max 请求吃 4022/4001 =
+	// 上游按账号权益下发档位，不是参数错误。与 modelBlocks 同纪律：只存
+	// 内存、TTL 自愈；仅封 max 改写，该号 dev 档照常可用。
+	maxBlocks map[string]time.Time
+
 	// 签到设备轮换代数与 9074 退避状态（持久化于 state.json，跨重启生效）。
 	// 代数只增不减：被风控标记的设备号一旦弃用就不再回头。
 	checkinGen        int
@@ -323,6 +336,12 @@ func (p *Pool) Pick() *auth.Auth {
 // model 为空 = 不限制；账号 models==nil = 尚未探测，按「可服务」处理。
 // 这条兜底很关键：能力数据缺失时宁可不限制，也不能让整池凭空 503。
 func servesLocked(e *entry, model string, now time.Time) bool {
+	return servesTierLocked(e, model, false, now)
+}
+
+// servesTierLocked servesLocked 的档位扩展：wantMax 时额外要求账号具备该模型
+// __max 权益（maxModels==nil 未探测 → 保守放行，与 models 缺失同一纪律）。
+func servesTierLocked(e *entry, model string, wantMax bool, now time.Time) bool {
 	if !e.healthy(now) {
 		return false
 	}
@@ -332,7 +351,28 @@ func servesLocked(e *entry, model string, now time.Time) bool {
 	if e.blockedFor(model, now) {
 		return false
 	}
+	if wantMax && model != "" {
+		if e.maxModels != nil && !e.maxModels[model] {
+			return false
+		}
+		if e.maxBlockedFor(model, now) {
+			return false
+		}
+	}
 	return true
+}
+
+// maxBlockedFor 同 blockedFor，作用于 __max 档拉黑表。独立于 1005 门禁表：
+// 两类拉黑的语义与自愈条件不同，混用会让 1005 的 TTL 清理误伤 max 记录。
+func (e *entry) maxBlockedFor(model string, now time.Time) bool {
+	if model == "" || len(e.maxBlocks) == 0 {
+		return false
+	}
+	t, ok := e.maxBlocks[model]
+	if !ok {
+		return false
+	}
+	return now.Sub(t) < modelBlockTTL
 }
 
 // modelBlockTTL (号,模型) 拉黑的存活期：到期自动重试（上游可能已放开该模型）。
@@ -430,6 +470,90 @@ func (p *Pool) SetModels(uid string, ids []string) {
 	}
 }
 
+// SetMaxModels 记录某账号实测带 __max 档的 config_name 集合（与 SetModels
+// 同源同轮写入）。传 nil = 清除（恢复「未探测」语义）；传空切片 = 探测过但
+// 全无 __max 档 —— 这是有价值的负知识，max 选号会过滤该号，不能与「未探测」
+// 混为一谈。只存内存：每轮目录刷新重建。
+func (p *Pool) SetMaxModels(uid string, ids []string) {
+	if ids == nil {
+		p.mu.Lock()
+		if e, ok := p.byUID[uid]; ok {
+			e.maxModels = nil
+		}
+		p.mu.Unlock()
+		return
+	}
+	set := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if id != "" {
+			set[id] = true
+		}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		e.maxModels = set // 空切片 → 空 map：探测过、全无 __max 档
+	}
+}
+
+// MaxServed 判断池里是否存在能以 max 档承接 model 的账号。任一号未探测
+// （maxModels==nil）都视为可能可服务 —— 未探测号在逐号门控（AccountMaxEntitled）
+// 处会放行，池级判断也必须放行，否则两侧口径打架；仅当全部已探测号都无该
+// 权益时返回 false，调用方据此把裸名升级整体降回 dev 档 —— 升级了也必然
+// 全号 4022，只会白烧轮次。数据缺失时不拦请求（与 ModelKnown 的「过滤是
+// 优化不是闸门」同一纪律）。
+func (p *Pool) MaxServed(model string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, e := range p.byUID {
+		if e.maxModels == nil || e.maxModels[model] {
+			return true
+		}
+	}
+	return false
+}
+
+// AccountMaxEntitled 判断 uid 当前是否可按 max 档请求 model：未探测号放行；
+// 已探测号必须在权益集内且未处于 max 拉黑期。
+func (p *Pool) AccountMaxEntitled(uid, model string) bool {
+	if model == "" {
+		return true
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e, ok := p.byUID[uid]
+	if !ok || e.maxModels == nil {
+		return true
+	}
+	if !e.maxModels[model] {
+		return false
+	}
+	return !e.maxBlockedFor(model, time.Now())
+}
+
+// BlockMaxModel 拉黑 (号,模型) 的 __max 档：该号对 max 请求吃 4022/4001 =
+// 上游按账号权益下发档位，换号可能解决（同模型其他号可正常 max）。仅封
+// max 改写，该号 dev 档照常可用；TTL 1h 自愈重试。
+func (p *Pool) BlockMaxModel(uid, model string) {
+	if model == "" {
+		return
+	}
+	now := time.Now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		if e.maxBlocks == nil {
+			e.maxBlocks = map[string]time.Time{}
+		}
+		e.maxBlocks[model] = now
+		for m, t := range e.maxBlocks {
+			if now.Sub(t) >= modelBlockTTL {
+				delete(e.maxBlocks, m)
+			}
+		}
+	}
+}
+
 // expireKey 规则①的排序键：最早到期时间；未探测（0）视为无穷远排最后。
 func expireKey(e *entry) int64 {
 	if e.nearestExpire <= 0 {
@@ -465,15 +589,16 @@ func expirePressure(best, bound *entry) bool {
 }
 
 // bestByRuleLocked 按规则序返回最优健康账号（只读，不修改 lastUsed / 绑定）。
-// 与 PickExcluding 同口径，供临期压制判断使用。model 非空时叠加能力过滤。
-func (p *Pool) bestByRuleLocked(tried map[string]bool, now time.Time, model string) *entry {
+// 与 PickExcluding 同口径，供临期压制判断使用。model 非空时叠加能力过滤，
+// wantMax 时再叠加 __max 权益过滤。
+func (p *Pool) bestByRuleLocked(tried map[string]bool, now time.Time, model string, wantMax bool) *entry {
 	var best *entry
 	var bestUID string
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
 			continue
 		}
-		if !servesLocked(e, model, now) {
+		if !servesTierLocked(e, model, wantMax, now) {
 			continue
 		}
 		if best == nil || betterEntry(e, best, uid, bestUID) {
@@ -531,7 +656,7 @@ const minPickGap = 100 * time.Millisecond
 // 这里额外叠加在途租约筛选与 100ms 防惊群窗口（短名单内优先挑久未使用的）。
 // pickBestCandidateLocked 综合健康检查、在途租约、规则序与防惊群窗口选号。
 // model 非空时只在能力匹配的账号里选（见 servesLocked）。
-func (p *Pool) pickBestCandidateLocked(tried map[string]bool, now time.Time, model string) *entry {
+func (p *Pool) pickBestCandidateLocked(tried map[string]bool, now time.Time, model string, wantMax bool) *entry {
 	type uidEntry struct {
 		uid string
 		e   *entry
@@ -541,7 +666,7 @@ func (p *Pool) pickBestCandidateLocked(tried map[string]bool, now time.Time, mod
 		if tried != nil && tried[uid] {
 			continue
 		}
-		if !servesLocked(e, model, now) {
+		if !servesTierLocked(e, model, wantMax, now) {
 			continue
 		}
 		ces = append(ces, uidEntry{uid: uid, e: e})
@@ -593,6 +718,17 @@ func (p *Pool) PickAffinity(sessionKey string, tried map[string]bool) *auth.Auth
 // 这些模型会间歇性 400/503 —— 列表说有、轮到没有该模型的号又失败。
 // model 为空 = 不做能力限制（等价旧行为）。
 func (p *Pool) PickAffinityForModel(sessionKey string, tried map[string]bool, model string) *auth.Auth {
+	return p.pickAffinity(sessionKey, tried, model, false)
+}
+
+// PickAffinityForTier 同 PickAffinityForModel，wantMax=true 时额外要求账号
+// 具备该 __max 档权益（见 servesTierLocked）：max 权益按账号漂移，无权益号
+// 提前出局，不靠请求打出去吃 4022 才发现。
+func (p *Pool) PickAffinityForTier(sessionKey string, tried map[string]bool, model string, wantMax bool) *auth.Auth {
+	return p.pickAffinity(sessionKey, tried, model, wantMax)
+}
+
+func (p *Pool) pickAffinity(sessionKey string, tried map[string]bool, model string, wantMax bool) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
@@ -601,10 +737,10 @@ func (p *Pool) PickAffinityForModel(sessionKey string, tried map[string]bool, mo
 	if sessionKey != "" {
 		if aff, ok := p.affinity[sessionKey]; ok {
 			if tried == nil || !tried[aff.uid] {
-				if e, exists := p.byUID[aff.uid]; exists && servesLocked(e, model, now) {
+				if e, exists := p.byUID[aff.uid]; exists && servesTierLocked(e, model, wantMax, now) {
 					// 临期压制：若存在明显更早到期的健康账号，放弃粘性改绑。
 					// 只按到期时间判定，不掺积分/UID —— 规则①优先于缓存收益。
-					if best := p.bestByRuleLocked(tried, now, model); expirePressure(best, e) {
+					if best := p.bestByRuleLocked(tried, now, model, wantMax); expirePressure(best, e) {
 						p.affinity[sessionKey] = affinityEntry{uid: best.a.UID, lastSeen: now}
 						best.lastUsed = now
 						return best.a
@@ -619,7 +755,7 @@ func (p *Pool) PickAffinityForModel(sessionKey string, tried map[string]bool, mo
 	}
 
 	// 2. 无粘性绑定或原账号已不可用/已满载，走三因子规则序（非加权）与防惊群短名单调度
-	best := p.pickBestCandidateLocked(tried, now, model)
+	best := p.pickBestCandidateLocked(tried, now, model, wantMax)
 	if best == nil {
 		return nil
 	}

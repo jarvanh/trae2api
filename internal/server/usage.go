@@ -63,7 +63,10 @@ type usageRecord struct {
 	Ms     int64  // 端到端耗时 ms
 	TTFB   int64  // 首字节耗时 ms（流式有意义；同步为 0）
 	Mode   string // "stream" | "sync" | "work-stream" | "work-sync"
-	Err    string // 失败原因摘要（成功为空；超长会被截断）
+	// Max 本次实际发往上游的请求是否 max 档（按账号注入；SOLO 通道才有意义）。
+	// 排障键：4022/4001 档位权益错误按账号下发，有这个标记才能事后归因。
+	Max bool
+	Err string // 失败原因摘要（成功为空；超长会被截断）
 }
 
 // maxUsageErr 失败原因落盘截断长度（含 \n 压平），避免超长错误撑爆 jsonl。
@@ -81,6 +84,7 @@ type usageEntry struct {
 	Ms     int64  `json:"ms,omitempty"`     // 端到端耗时 ms
 	TTFB   int64  `json:"ttfb,omitempty"`   // 首字节 ms
 	Mode   string `json:"mode,omitempty"`   // stream / sync / work-*（旧记录无 → 空）
+	Max    bool   `json:"max,omitempty"`    // 本次实际发往上游为 max 档（旧记录无 → false）
 	Err    string `json:"err,omitempty"`    // 失败摘要
 }
 
@@ -124,6 +128,7 @@ func recordUsage(rec usageRecord) {
 		Ms:     rec.Ms,
 		TTFB:   rec.TTFB,
 		Mode:   rec.Mode,
+		Max:    rec.Max,
 		Err:    rec.Err,
 	}
 	raw, err := json.Marshal(e)

@@ -88,33 +88,6 @@ func SetMaxTierMode(src []byte) []byte {
 	return out
 }
 
-// StripMaxTierMode 撤销 SetMaxTierMode：model 去掉 __max 后缀（config_name
-// 一并剥后缀兜底，正常本就是裸名），删除 extra_info.v2_max_mode_enabled。
-// SOLO→Work 回退路径用 —— Work 通道没有档位概念，bridge 模式透传原始 body，
-// 改写残留可能被桥接端误消费。无法解析时原样返回。
-func StripMaxTierMode(src []byte) []byte {
-	if len(src) == 0 {
-		return src
-	}
-	var obj map[string]any
-	if err := json.Unmarshal(src, &obj); err != nil {
-		return src
-	}
-	if s, ok := obj["config_name"].(string); ok {
-		obj["config_name"] = strings.TrimSuffix(s, MaxTierSuffix)
-	}
-	if s, ok := obj["model"].(string); ok {
-		obj["model"] = strings.TrimSuffix(s, MaxTierSuffix)
-	}
-	if extra, ok := obj[maxModeExtraInfoKey].(map[string]any); ok {
-		delete(extra, maxModeField)
-		if len(extra) == 0 {
-			delete(obj, maxModeExtraInfoKey)
-		}
-	}
-	out, err := json.Marshal(obj)
-	if err != nil {
-		return src
-	}
-	return out
-}
+// StripMaxTierMode 已删除（2026-10-31）：档位改写下沉到选号循环按账号注入后，
+// SOLO 主循环的 body 恒为未改写基底，Work 回退直接透传，不再需要事后剥离；
+// Work 回退请求的清洁性由 handler_test 的回退断言（不含 __max/v2_max_mode_enabled）守护。

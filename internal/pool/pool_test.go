@@ -743,3 +743,84 @@ func TestHealthyExcludesCooling(t *testing.T) {
 		t.Fatalf("healthy=%v want 只有 u1", got)
 	}
 }
+
+// TestPickForTierMaxEntitlement 覆盖 2026-10-31 max 权益预门控：
+// __max 档按账号下发（get_detail_param 档位表逐号漂移），wantMax 选号只落
+// 在权益集内的账号；空集（探测过、全无档）≠ 未探测（nil，保守放行）。
+func TestPickForTierMaxEntitlement(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at1"})
+	p.Add(&auth.Auth{UID: "u2", AccessToken: "at2"})
+	p.SetCredits("u1", 1000)
+	p.SetCredits("u2", 1000)
+	p.SetMaxModels("u1", []string{"glm-5.3"})
+	p.SetMaxModels("u2", []string{})
+
+	// wantMax：只有 u1 可承接（u2 已探测且无权益，提前出局）
+	if got := p.PickAffinityForTier("", nil, "glm-5.3", true); got == nil || got.UID != "u1" {
+		t.Fatalf("pick(max glm-5.3)=%v want u1", got)
+	}
+	// dev 请求不受 max 权益限制（models 未探测 = 不限制），应正常选到号
+	if got := p.PickAffinityForTier("", nil, "glm-5.3", false); got == nil {
+		t.Fatal("dev 请求应正常选号")
+	}
+	// 池内权益判定：glm-5.3 有人可承接；other 全部已探测且无权益
+	if !p.MaxServed("glm-5.3") {
+		t.Error("MaxServed(glm-5.3)=false, u1 有权益应为 true")
+	}
+	if p.MaxServed("other") {
+		t.Error("MaxServed(other)=true, 全部已探测且无权益应为 false")
+	}
+	if !p.AccountMaxEntitled("u-unknown", "glm-5.3") {
+		t.Error("未知账号应放行（宁可不限制）")
+	}
+	if p.AccountMaxEntitled("u2", "glm-5.3") {
+		t.Error("u2 无 glm-5.3 max 权益应为 false")
+	}
+}
+
+// TestMaxServedUnprobedPermissive 未探测（冷启动/目录拉取失败）不得拦请求：
+// 任一号未探测 → MaxServed 视为可服务；全部探测且无权益才判 false。
+func TestMaxServedUnprobedPermissive(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "probed-empty", AccessToken: "at1"})
+	p.Add(&auth.Auth{UID: "unprobed", AccessToken: "at2"})
+	p.SetMaxModels("probed-empty", []string{})
+	if !p.MaxServed("glm-5.3") {
+		t.Error("存在未探测号时应放行")
+	}
+	p.SetMaxModels("unprobed", []string{})
+	if p.MaxServed("glm-5.3") {
+		t.Error("全部已探测且无权益应为 false")
+	}
+}
+
+// TestBlockMaxModel 运行时拉黑只封 __max 档：该号 dev 档照常可选，
+// 其他账号不受影响；全部拉黑后 wantMax 无候选返回 nil（调用方降级 dev）。
+func TestBlockMaxModel(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at1"})
+	p.Add(&auth.Auth{UID: "u2", AccessToken: "at2"})
+	p.SetCredits("u1", 1000)
+	p.SetCredits("u2", 1000)
+	p.SetMaxModels("u1", []string{"glm-5.3"})
+	p.SetMaxModels("u2", []string{"glm-5.3"})
+
+	p.BlockMaxModel("u1", "glm-5.3")
+	if p.AccountMaxEntitled("u1", "glm-5.3") {
+		t.Error("拉黑后 u1 不应有 max 权益")
+	}
+	if !p.AccountMaxEntitled("u2", "glm-5.3") {
+		t.Error("u2 不受 u1 拉黑影响")
+	}
+	if got := p.PickAffinityForTier("", nil, "glm-5.3", true); got == nil || got.UID != "u2" {
+		t.Fatalf("pick(max)=%v want u2（u1 已拉黑）", got)
+	}
+	if got := p.PickAffinityForTier("", nil, "glm-5.3", false); got == nil {
+		t.Fatal("u1 dev 档应照常可选")
+	}
+	p.BlockMaxModel("u2", "glm-5.3")
+	if got := p.PickAffinityForTier("", nil, "glm-5.3", true); got != nil {
+		t.Fatalf("全部拉黑后 wantMax 应返回 nil, got=%v", got)
+	}
+}
