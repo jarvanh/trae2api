@@ -30,5 +30,8 @@ func inflightSnapshot() map[string]any {
 	return map[string]any{
 		"inflight":      inflightCur.Load(),
 		"inflight_peak": inflightPeak.Load(),
+		// trae2api 没有实现并发闸门/队列：不设上限，返回 null 而不是编造数字。
+		"max_concurrency": nil,
+		"max_note":        "无并发闸门",
 	}
 }
