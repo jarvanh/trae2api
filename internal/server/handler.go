@@ -104,7 +104,7 @@ func NewHandler(cfg Config) *Handler {
 		cfg.WorkMode = cfg.WorkClient.Mode()
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux(), logins: map[string]*pendingLogin{}}
-	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.withInflight(h.chatCompletions)))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -184,7 +184,22 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// withInflight 只包业务请求，观测端点不计数（看板轮询不会自抬曲线）。
+func (h *Handler) withInflight(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		beginInflight()
+		defer endInflight()
+		next(w, r)
+	}
+}
+
 func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
+	// 保留纯文本 "ok" 的既有存活探测契约（Dockerfile HEALTHCHECK 依赖它），
+	// 在途指标改由 /healthz?detail=1 返回 JSON，避免破坏旧调用方。
+	if r.URL.Query().Get("detail") == "1" {
+		writeJSON(w, http.StatusOK, inflightSnapshot())
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))
 }
