@@ -27,7 +27,7 @@ type Config struct {
 	Upstream     *upstream.Client
 	WorkClient   *upstream.WorkClient
 	WorkMode     upstream.WorkMode
-	APIKey       string        // 空 = 不鉴权
+	APIKey       string        // 空 = 不鉴权（仅限回环监听，启动时强制校验）
 	AuthDir      string        // auths/ 目录，用于 import/delete 落盘 trae-*.json
 	UsageDir     string        // 用量明细目录（/app/data），空 = 不落盘
 	MaxRotate    int           // 单请求最多换号次数，默认 3
@@ -108,27 +108,27 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
-	// 管理面板：本地面板
-	// 读接口无鉴权（局域网内只读）；写接口（accounts 写/login/refresh/authorize）
-	// 经 withAdminAuth 校验 Bearer = TW2A_API_KEY（见 §4 安全设计）。
+	// 管理面板：本地页面；所有管理 API（含读接口）统一走 withAdminAuth。
+	// 未配置 TW2A_API_KEY 时仍可访问（仅回环监听的本地场景，见 cmd/server
+	// 启动时的安全校验）；配置了 key 则读写一律要求 Bearer（T3）。
 	h.mux.HandleFunc("GET /admin", h.adminPage)
-	h.mux.HandleFunc("GET /admin/api/credits", h.adminCredits)
-	h.mux.HandleFunc("GET /admin/api/models", h.adminModels)
-	// 请求流水：读 usage-<日期>.jsonl 明细 + 聚合（只读，无鉴权）
-	h.mux.HandleFunc("GET /admin/api/usage", h.adminUsage)
-	// 控制台拖动排序：GET 读已保存顺序，POST 保存（写操作需 Bearer = TW2A_API_KEY）
-	h.mux.HandleFunc("GET /admin/api/order", h.adminGetOrder)
+	h.mux.HandleFunc("GET /admin/api/credits", h.withAdminAuth(h.adminCredits))
+	h.mux.HandleFunc("GET /admin/api/models", h.withAdminAuth(h.adminModels))
+	// 请求流水：读 usage-<日期>.jsonl 明细 + 聚合
+	h.mux.HandleFunc("GET /admin/api/usage", h.withAdminAuth(h.adminUsage))
+	// 控制台拖动排序：GET 读已保存顺序，POST 保存
+	h.mux.HandleFunc("GET /admin/api/order", h.withAdminAuth(h.adminGetOrder))
 	h.mux.HandleFunc("POST /admin/api/order", h.withAdminAuth(h.adminSaveOrder))
 	// 账号 CRUD
-	h.mux.HandleFunc("GET /admin/api/accounts", h.adminAccounts)
+	h.mux.HandleFunc("GET /admin/api/accounts", h.withAdminAuth(h.adminAccounts))
 	h.mux.HandleFunc("POST /admin/api/accounts/import", h.withAdminAuth(h.adminImportAccount))
 	h.mux.HandleFunc("DELETE /admin/api/accounts/{uid}", h.withAdminAuth(h.adminDeleteAccount))
 	h.mux.HandleFunc("PATCH /admin/api/accounts/{uid}", h.withAdminAuth(h.adminPatchAccount))
 	h.mux.HandleFunc("POST /admin/api/accounts/{uid}/refresh", h.withAdminAuth(h.adminRefreshAccount))
-	h.mux.HandleFunc("GET /admin/api/accounts/{uid}/json", h.adminAccountJSON)
+	h.mux.HandleFunc("GET /admin/api/accounts/{uid}/json", h.withAdminAuth(h.adminAccountJSON))
 	// Web 登录闭环
 	h.mux.HandleFunc("POST /admin/api/login", h.withAdminAuth(h.adminLoginStart))
-	h.mux.HandleFunc("GET /admin/api/login/result", h.adminLoginResult)
+	h.mux.HandleFunc("GET /admin/api/login/result", h.withAdminAuth(h.adminLoginResult))
 	h.mux.HandleFunc("POST /admin/api/login/cancel", h.withAdminAuth(h.adminLoginCancel))
 	// TRAE 回调落点（/authorize）：无需 Bearer（TRAE 浏览器 302 不带 key），
 	// 仅捕获 query 写 pending 队列，不直接落盘 token。
@@ -136,9 +136,10 @@ func NewHandler(cfg Config) *Handler {
 	return h
 }
 
-// withAdminAuth 校验写操作的 Bearer API Key（常量时间比较，复用 withAuth 逻辑）。
-// APIKey 为空时（未配置 TW2A_API_KEY）退化为不鉴权——本地无 key 场景仍可用，
-// 但生产强烈建议配 key（见 PLAN §4）。
+// withAdminAuth 校验管理 API 的 Bearer API Key（常量时间比较，复用 withAuth 逻辑）。
+// 读、写管理接口都必须挂这个中间件：账号列表/额度/流水本身就是敏感数据（T3/T4）。
+// APIKey 为空时退化为不鉴权——启动阶段已强制「空 key 仅允许回环监听」
+// （cmd/server 的 listen 校验），因此这只影响本机面板场景。
 func (h *Handler) withAdminAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if h.cfg.APIKey == "" {
@@ -162,6 +163,15 @@ func (h *Handler) withAdminAuth(next http.HandlerFunc) http.HandlerFunc {
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
+}
+
+// CallbackHandler 返回回调端口专用的最小路由：只暴露 TRAE 登录回调 /authorize。
+// 回调端口可能被 Docker 映射到宿主机（浏览器要能访问 127.0.0.1:18080），
+// 绝不能把 /admin、/v1 等完整 Handler 路由一起暴露出去（T8）。
+func (h *Handler) CallbackHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /authorize", h.authorizeCallback)
+	return mux
 }
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {

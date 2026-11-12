@@ -1,7 +1,8 @@
-// 管理面板（/admin）：只读查询，无鉴权（本地面板）；CLI 操作留待开发。
+// 管理面板（/admin）：只读查询；API 统一经 withAdminAuth（配置 key 时）。
 package server
 
 import (
+	"context"
 	_ "embed"
 	"encoding/json"
 	"io"
@@ -27,6 +28,13 @@ func (h *Handler) adminPage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write(adminPageHTML)
 }
+
+// 每号 2-3 次上游请求，必须先过 withAdminAuth，且单次请求有账号数/超时上限，
+// 避免一个 GET 被放大成无界扇出（T4）。
+const (
+	adminCreditsMaxAccounts = 100
+	adminCreditsTimeout     = 60 * time.Second
+)
 
 // adminCredits 查询全部账号的实时额度 + 签到状态（并发拉取上游）。
 func (h *Handler) adminCredits(w http.ResponseWriter, r *http.Request) {
@@ -62,13 +70,26 @@ func (h *Handler) adminCredits(w http.ResponseWriter, r *http.Request) {
 		Error          string     `json:"error,omitempty"`
 	}
 
-	st := h.cfg.Pool.List()
+	all := h.cfg.Pool.List()
+	truncated := false
+	if len(all) > adminCreditsMaxAccounts {
+		all = all[:adminCreditsMaxAccounts]
+		truncated = true
+	}
+	st := all
 	out := make([]acct, len(st))
+	// 整体超时：单号最多 2-3 次上游请求，挂住的账号不能把整个面板拖死。
+	ctx, cancel := context.WithTimeout(r.Context(), adminCreditsTimeout)
+	defer cancel()
 	var wg sync.WaitGroup
 	for i, s := range st {
 		wg.Add(1)
 		go func(i int, s pool.Status) {
 			defer wg.Done()
+			if ctx.Err() != nil {
+				out[i] = acct{UID: s.UID, Nickname: s.Nickname, Error: "request timeout before probe"}
+				return
+			}
 			a := h.cfg.Pool.AuthByUID(s.UID)
 			if a == nil {
 				out[i] = acct{UID: s.UID, Nickname: s.Nickname, Error: "no auth found"}
@@ -85,7 +106,7 @@ func (h *Handler) adminCredits(w http.ResponseWriter, r *http.Request) {
 			// 只是多解析了 display_desc / start_time / expire_time —— 同样一次
 			// 请求，既拿到聚合额度也拿到每包过期时间，无需额外调用。
 			ac.NearestDays = -1
-			packs, perr := h.cfg.Upstream.PackList(a)
+			packs, perr := h.cfg.Upstream.PackListCtx(ctx, a)
 			if perr != nil {
 				ac.Error = "pack_list: " + perr.Error()
 			} else {
@@ -116,7 +137,7 @@ func (h *Handler) adminCredits(w http.ResponseWriter, r *http.Request) {
 			}
 			// 面板展示用：设备号与签到路径同源（按当前代数派生）
 			checkinDeviceID := upstream.CheckinDeviceID(upstream.CheckinIdentity(a), h.cfg.Pool.CheckinGeneration(s.UID))
-			checkedIn, credits, enable, cerr := h.cfg.Upstream.CheckinStatus(a, checkinDeviceID)
+			checkedIn, credits, enable, cerr := h.cfg.Upstream.CheckinStatusCtx(ctx, a, checkinDeviceID)
 			if cerr != nil {
 				if ac.Error != "" {
 					ac.Error += "; "
@@ -126,7 +147,7 @@ func (h *Handler) adminCredits(w http.ResponseWriter, r *http.Request) {
 				ac.CheckedIn, ac.CheckinCredits, ac.CheckinEnable = checkedIn, credits, enable
 			}
 			if h.cfg.WorkClient != nil && h.cfg.WorkMode != upstream.WorkModeDisabled {
-				if snap, werr := h.cfg.WorkClient.ProbeCredits(r.Context(), a); werr == nil {
+				if snap, werr := h.cfg.WorkClient.ProbeCredits(ctx, a); werr == nil {
 					ac.WorkCredits = snap.WorkCredits
 					h.cfg.Pool.SetWorkCredits(s.UID, snap.WorkCredits)
 				}
@@ -150,6 +171,7 @@ func (h *Handler) adminCredits(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"fetched_at": time.Now().Format("2006-01-02 15:04:05"),
 		"accounts":   ordered,
+		"truncated":  truncated,
 	})
 }
 
@@ -330,7 +352,7 @@ func reorderBy(ids []string, order []string) []string {
 	return out
 }
 
-// adminGetOrder 返回已保存的控制台顺序（读接口，无鉴权）。
+// adminGetOrder 返回已保存的控制台顺序（读接口，需 admin 鉴权）。
 func (h *Handler) adminGetOrder(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, h.loadUIOrder())
 }
@@ -341,7 +363,7 @@ func (h *Handler) adminGetOrder(w http.ResponseWriter, r *http.Request) {
 // 除单日外还支持区间（7 天 / 30 天）：跨多个 usage-*.jsonl 汇总，
 // 聚合全程累计、明细只留最新 limit 条，并额外给出按天摘要供面板画趋势柱。
 //
-// 只读接口，无鉴权（与 credits/models 一致，局域网内面板）。
+// 只读接口，需 admin 鉴权（与 credits/models 一致）。
 // 参数：
 //   - date  ：北京日期 YYYY-MM-DD，默认今天；区间模式下作为**结束日**
 //   - range ：1d(默认) | 7d | 30d，统计区间跨度

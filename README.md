@@ -91,7 +91,7 @@ go build -o trae2api ./cmd/server
 - **账号总览**：实时查看各账号的剩余积分、配额总量、已用积分、权益包数及签到状态。
 - **Web 登录闭环**：在面板点击发起登录，浏览器完成验证后回调自动回传至服务并完成 Token 换取与热加载，无需手动复制凭证。
 - **凭证管理**：支持粘贴 JSON 凭证或回调链接直接导入账号，支持随时启停软开关、修改备注昵称或删除失效账号。
-- **安全脱敏**：前端展示严格脱敏（仅显示前缀与长度），写操作（导入、删除、修改）均受 `TW2A_API_KEY` 保护。
+- **安全脱敏**：前端展示严格脱敏（仅显示前缀与长度）；配置 `TW2A_API_KEY` 后，管理面板的读写接口（额度、流水、账号、登录状态等）均要求 Bearer 鉴权。
 
 ## API 调用示例
 
@@ -148,12 +148,13 @@ curl -X POST http://127.0.0.1:7864/v1/chat/completions \
 
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
-| `TW2A_API_KEY` | (必填) | 服务鉴权密钥，用于 API 调用与控制台写操作 |
-| `TW2A_LISTEN` | `:7864` | 主服务监听地址及端口 |
+| `TW2A_API_KEY` | (必填) | 服务鉴权密钥，用于 API 调用与控制台读写操作；为空时仅允许回环监听 |
+| `TW2A_LISTEN` | `127.0.0.1:7864` | 主服务监听地址及端口（暴露到局域网时必须配置 API Key） |
 | `TW2A_AUTH_DIR` | `./auths` | 账号凭证存储目录 |
 | `TW2A_STATE_FILE` | `./data/state.json` | 账号池状态持久化文件 |
 | `TW2A_DEFAULT_MODEL` | `glm-5.2` | 默认回退请求模型 |
 | `TW2A_CALLBACK_PORT` | `18080` | 本地 OAuth 回调端口（设为 0 可关闭） |
+| `TW2A_CALLBACK_LISTEN` | `127.0.0.1:18080` | 回调服务监听地址（容器内需显式设为 `0.0.0.0:18080`） |
 | `TW2A_TIMEOUT_SECONDS` | `120` | 上游请求超时时长（秒） |
 | `TW2A_FUNCTION` | `solo_agent` | 上游 function 通道；填 `solo_work_lite` 可回滚旧免费通道（无 max 档，上下文上限 200K） |
 | `TW2A_MAX_TIER_MODE` | `auto` | 裸名请求档位策略：`auto` = 目录确认含 `__max` 档即升级（1M 窗口）；`dev` = 全保持 dev 档。显式 `<model>__max`/`__dev` 点名不受影响（config.json 键 `upstream.max_tier_mode`） |

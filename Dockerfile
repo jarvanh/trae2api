@@ -55,6 +55,10 @@ RUN set -eux; \
 
 USER app
 WORKDIR /app
+# 容器内监听必须绑 0.0.0.0 才能被 -p/端口映射转发；宿主机侧只发布必要端口
+# （回调 18080 建议 127.0.0.1:18080）。非容器部署默认仍是 127.0.0.1（安全默认）。
+ENV TW2A_LISTEN=0.0.0.0:7864 \
+    TW2A_CALLBACK_LISTEN=0.0.0.0:18080
 EXPOSE 7864
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \
   CMD wget -qO- http://127.0.0.1:7864/healthz || exit 1

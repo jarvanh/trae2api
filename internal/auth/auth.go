@@ -7,11 +7,23 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+// uidPattern 账号 UID 白名单：只允许字母、数字、下划线和横线，长度 1-64。
+// UID 会拼进落盘文件名（trae-<uid>.json），必须从入口严格限制，
+// 否则 "../x" / "a/b" / "..%2F.." 之类会穿越出 auths 目录（T1/T6/T14）。
+var uidPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+// ValidUID 报告 uid 是否通过白名单校验。所有从外部输入（回调 query、
+// 管理 API 路径/请求体）取得的 UID 在落盘或删路径前都必须过这里。
+func ValidUID(uid string) bool {
+	return uidPattern.MatchString(uid)
+}
 
 // Auth 归一化后的账号凭证。
 //
@@ -177,7 +189,8 @@ func Parse(raw []byte) (*Auth, error) {
 	return a, nil
 }
 
-// SaveAtomic 以嵌套形原子写回 FilePath（tmp + rename，0600），保持登录脚本可读格式。
+// SaveAtomic 以嵌套形原子写回 FilePath（唯一临时文件 + fsync + rename，0600），
+// 保持登录脚本可读格式。
 // 加锁外壳：防止与 RefreshToken 并发读写 token 字段导致写回半更新。
 func (a *Auth) SaveAtomic() error {
 	a.mu.Lock()
@@ -210,16 +223,52 @@ func (a *Auth) saveAtomicLocked() error {
 	if err != nil {
 		return err
 	}
-	tmp := a.FilePath + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	// 唯一临时文件名：固定 ".tmp" 在同进程多 Auth 实例或跨进程并发写同一
+	// 路径时会互相截断/覆盖，rename 可能把半截内容换成正式文件（T10）。
+	// CreateTemp 已按 0600 创建，天然无符号链接跟随风险。
+	dir := filepath.Dir(a.FilePath)
+	f, err := os.CreateTemp(dir, ".trae-auth-*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, a.FilePath)
+	tmp := f.Name()
+	cleanup := func() {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+	}
+	if _, err := f.Write(raw); err != nil {
+		cleanup()
+		return err
+	}
+	// fsync 后再 rename：避免掉电时出现「文件已改名但内容为空」。
+	if err := f.Sync(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, a.FilePath); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	// 目录项也 fsync 一次，保证 rename 本身落盘（尽力而为，不支持则忽略）。
+	if d, derr := os.Open(dir); derr == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }
 
 // FilePathFor 在已知 AuthDir 时构造 trae-{uid}.json 落盘路径。
-func FilePathFor(authDir, uid string) string {
-	return filepath.Join(authDir, "trae-"+uid+".json")
+// UID 必须通过白名单校验：本函数是落盘/删除路径的最后一道闸，
+// 即使调用方漏了校验也不会拼出 auths 目录之外的路径。
+func FilePathFor(authDir, uid string) (string, error) {
+	if !ValidUID(uid) {
+		return "", fmt.Errorf("invalid uid %q: must match %s", uid, uidPattern.String())
+	}
+	return filepath.Join(authDir, "trae-"+uid+".json"), nil
 }
 
 // MaskToken 保留前 n 字符 + 省略号；不足则全显示。用于面板 JSON 预览脱敏。

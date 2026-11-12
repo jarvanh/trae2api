@@ -3,7 +3,9 @@
 //
 // 回调端口策略（M0 结论：双端口 18080）：
 //   - TRAE 登录页回调到 http://127.0.0.1:18080/authorize
-//   - main.go 起第二个 http.Server 监听 18080，复用同一 Handler（/authorize 在主 mux 已注册）
+//   - main.go 起第二个 http.Server 监听 18080，只挂 CallbackHandler（最小路由：
+//     仅 /authorize），不暴露管理/代理路由（T8）；
+//   - 回调必须绑定到管理面已发起的 pending 登录后才会落盘（T1）。
 //   - 回调捕获后直接在服务端完成导入（用户无需再粘赖）
 //
 // pending 态只在内存（重启丢失），符合「登录态瞬时」语义。
@@ -14,6 +16,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,10 +27,11 @@ import (
 type pendingState string
 
 const (
-	pendingStateActive   pendingState = "pending"  // 等待用户登录回调
-	pendingStateSuccess  pendingState = "success"  // 回调捕获 + 落盘成功
-	pendingStateFailed   pendingState = "failed"   // ExchangeToken/落盘失败
-	pendingStateCanceled pendingState = "canceled" // 用户取消
+	pendingStateActive     pendingState = "pending"    // 等待用户登录回调
+	pendingStateProcessing pendingState = "processing" // 回调已绑定，正在换 token/落盘（单次消费）
+	pendingStateSuccess    pendingState = "success"    // 回调捕获 + 落盘成功
+	pendingStateFailed     pendingState = "failed"     // ExchangeToken/落盘失败
+	pendingStateCanceled   pendingState = "canceled"   // 用户取消
 )
 
 // pendingLogin 单次登录的临时上下文。
@@ -61,6 +65,12 @@ func (h *Handler) adminLoginStart(w http.ResponseWriter, r *http.Request) {
 	_ = decodeBodyOptional(r, &req)
 	if req.CallbackPort == "" {
 		req.CallbackPort = "18080"
+	}
+	// 端口必须是纯数字：它会拼进 auth_callback_url，不能容忍 "/"、"?" 等
+	// 注入额外 path/query 的字符。
+	if n, perr := strconv.Atoi(req.CallbackPort); perr != nil || n < 1 || n > 65535 {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "callback_port must be a TCP port (1-65535)")
+		return
 	}
 	callbackURL := "http://127.0.0.1:" + req.CallbackPort + "/authorize"
 
@@ -143,7 +153,13 @@ func (h *Handler) adminLoginCancel(w http.ResponseWriter, r *http.Request) {
 
 // authorizeCallback GET /authorize：TRAE 回调落点。
 // 捕获 query → 解析 → ExchangeToken → GetUserInfo → 落盘 → 标记 pending 成功。
-// pending_id 通过 TRAE 无法回传（回调 URL 固定），用 machine_id 反查 pending（一一对应）。
+//
+// 安全约束（T1）：
+//   - 回调必须绑定到一次已由管理面发起的 pending 登录（loginTraceID / machine_id
+//     反查，且 pending 仍为 active）；找不到即拒绝，绝不「无 pending 直接落盘」。
+//   - UID 只信服务端 GetUserInfo 的结果，且必须过 auth.ValidUID 白名单；
+//     query 里的 userInfo.UserID 只作为候选，不能绕过校验写文件。
+//   - 落盘路径由 auth.FilePathFor 再校验一次，防目录穿越。
 func (h *Handler) authorizeCallback(w http.ResponseWriter, r *http.Request) {
 	rawURL := r.URL.String()
 	if !strings.HasPrefix(rawURL, "http") {
@@ -156,20 +172,20 @@ func (h *Handler) authorizeCallback(w http.ResponseWriter, r *http.Request) {
 		authorizeRender(w, http.StatusBadRequest, "登录回调解析失败", err.Error())
 		return
 	}
-	// 用 machine_id 反查 pending（pending 的 machineID 与回调 query.machine_id 一致）
-	// 兜底：若 query 无 machine_id 或无 pending，仍可凭 refreshToken 落盘（无 pending 上下文则 machine/device 用回调里的或新生成）
-	machineID := r.URL.Query().Get("machine_id")
-	deviceID := r.URL.Query().Get("device_id")
-	traceID := r.URL.Query().Get("loginTraceID")
-	// TRAE 回调不回传 machine_id/device_id，但回传 loginTraceID（= machineTraceID(machine,device) 派生）
-	// → 用 loginTraceID 反查 pending 拿回登录时生成的那一对 id，保证凭证与登录态一致
-	if machineID == "" || deviceID == "" {
-		if traceID != "" {
-			if pl, ok := h.getPendingByTrace(traceID); ok {
-				machineID, deviceID = pl.machineID, pl.deviceID
-			}
-		}
+	// TRAE 回调不回传 machine_id/device_id/pending_id，但回传 loginTraceID
+	//（= machineTraceID(machine,device) 派生）。必须用它（或 machine_id）反查到
+	// 一个尚未消费的 pending，才能继续落盘。
+	pl, ok := h.bindPendingCallback(
+		r.URL.Query().Get("machine_id"),
+		r.URL.Query().Get("device_id"),
+		r.URL.Query().Get("loginTraceID"),
+	)
+	if !ok {
+		authorizeRender(w, http.StatusForbidden, "登录回调无效",
+			"未找到对应的登录流程（pending 不存在、已使用或已过期）。请回到管理面板重新发起登录。")
+		return
 	}
+	machineID, deviceID := pl.machineID, pl.deviceID
 
 	a := &auth.Auth{
 		AccessToken:  info.AccessToken,
@@ -186,52 +202,67 @@ func (h *Handler) authorizeCallback(w http.ResponseWriter, r *http.Request) {
 	// 有 refreshToken → ExchangeToken 换新 access + 轮换 refreshToken
 	if a.RefreshToken != "" {
 		if exErr := h.cfg.Upstream.RefreshToken(a); exErr != nil {
-			// 失败也继续（可能 refreshToken 已被轮换），但标记错误
-			h.markPendingByMachine(machineID, traceID, pendingStateFailed, "", "", exErr.Error())
+			h.markPendingByMachine(machineID, "", pendingStateFailed, "", "", exErr.Error())
 			authorizeRender(w, http.StatusBadGateway, "ExchangeToken 失败", exErr.Error())
 			return
 		}
 	}
-	// GetUserInfo 补全 uid/nickname
+	// UID 只信服务端 GetUserInfo：query 里的 userInfo 可被回调链接伪造，
+	// 不能作为落盘依据。GetUserInfo 失败即失败关闭（T1）。
 	uid, nick, ent, gErr := h.cfg.Upstream.GetUserInfo(a)
-	if gErr == nil && uid != "" {
+	if gErr != nil {
+		h.markPendingByMachine(machineID, "", pendingStateFailed, "", "", gErr.Error())
+		authorizeRender(w, http.StatusBadGateway, "获取账号信息失败", gErr.Error())
+		return
+	}
+	if uid != "" {
 		a.UID = uid
-		if nick != "" {
-			a.Nickname = nick
-		}
-		if ent != "" {
-			a.EnterpriseID = ent
-		}
+	}
+	if nick != "" {
+		a.Nickname = nick
+	}
+	if ent != "" {
+		a.EnterpriseID = ent
 	}
 	if a.UID == "" {
-		err := errors.New("cannot determine uid from callback or GetUserInfo")
-		h.markPendingByMachine(machineID, traceID, pendingStateFailed, "", "", err.Error())
+		err := errors.New("cannot determine uid from GetUserInfo")
+		h.markPendingByMachine(machineID, "", pendingStateFailed, "", "", err.Error())
+		authorizeRender(w, http.StatusBadRequest, "登录失败", err.Error())
+		return
+	}
+	if !auth.ValidUID(a.UID) {
+		err := errors.New("invalid uid in callback (must match ^[A-Za-z0-9_-]{1,64}$)")
+		h.markPendingByMachine(machineID, "", pendingStateFailed, "", "", err.Error())
 		authorizeRender(w, http.StatusBadRequest, "登录失败", err.Error())
 		return
 	}
 	if a.AccessToken == "" {
 		err := errors.New("no access token after exchange")
-		h.markPendingByMachine(machineID, traceID, pendingStateFailed, "", "", err.Error())
+		h.markPendingByMachine(machineID, "", pendingStateFailed, "", "", err.Error())
 		authorizeRender(w, http.StatusBadRequest, "登录失败", err.Error())
 		return
 	}
 
 	// 落盘
-	if a.FilePath == "" {
-		a.FilePath = auth.FilePathFor(h.cfg.AuthDir, a.UID)
+	fp, fpErr := auth.FilePathFor(h.cfg.AuthDir, a.UID)
+	if fpErr != nil {
+		h.markPendingByMachine(machineID, "", pendingStateFailed, "", "", fpErr.Error())
+		authorizeRender(w, http.StatusBadRequest, "登录失败", fpErr.Error())
+		return
 	}
+	a.FilePath = fp
 	if mkErr := mkdirAll(h.cfg.AuthDir); mkErr != nil {
-		h.markPendingByMachine(machineID, traceID, pendingStateFailed, a.UID, a.Nickname, mkErr.Error())
+		h.markPendingByMachine(machineID, "", pendingStateFailed, a.UID, a.Nickname, mkErr.Error())
 		authorizeRender(w, http.StatusInternalServerError, "落盘失败", mkErr.Error())
 		return
 	}
 	if err := a.SaveAtomic(); err != nil {
-		h.markPendingByMachine(machineID, traceID, pendingStateFailed, a.UID, a.Nickname, err.Error())
+		h.markPendingByMachine(machineID, "", pendingStateFailed, a.UID, a.Nickname, err.Error())
 		authorizeRender(w, http.StatusInternalServerError, "落盘失败", err.Error())
 		return
 	}
 	h.cfg.Pool.Add(a)
-	h.markPendingByMachine(machineID, traceID, pendingStateSuccess, a.UID, a.Nickname, "")
+	h.markPendingByMachine(machineID, "", pendingStateSuccess, a.UID, a.Nickname, "")
 
 	authorizeRender(w, http.StatusOK, "登录成功", "账号 "+a.UID+"（"+a.Nickname+"）已添加，可关闭此窗口返回面板。")
 }
@@ -260,18 +291,35 @@ func (h *Handler) markPendingByMachine(machineID, traceID string, state pendingS
 	}
 }
 
-// getPendingByTrace 用 loginTraceID（= machineTraceID(machine,device)）反查 pending。
-// TRAE 回调不回传 machine_id/device_id，但回传 loginTraceID，可据此关联回登录时生成的 id 对。
-func (h *Handler) getPendingByTrace(traceID string) (*pendingLogin, bool) {
-	if traceID == "" {
+// bindPendingCallback 把一次 /authorize 回调绑定到已发起的 pending 登录，
+// 并原子地把该 pending 置为 processing（单次消费）。
+//
+// 匹配优先级：loginTraceID（TRAE 回调实际回传，= machineTraceID(machine,device)）
+// 或 machine_id（兼容显式带上 machine/device 的客户端）。只接受 active 且未过期
+// 的 pending；没有任何匹配 → false，调用方必须拒绝，不能落盘。
+func (h *Handler) bindPendingCallback(machineID, deviceID, traceID string) (*pendingLogin, bool) {
+	if machineID == "" && traceID == "" {
 		return nil, false
 	}
 	h.loginMu.Lock()
 	defer h.loginMu.Unlock()
-	for _, pl := range h.logins {
-		if machineTraceID(pl.machineID, pl.deviceID) == traceID {
-			return pl, true
+	for id, pl := range h.logins {
+		if time.Since(pl.createdAt) > 10*time.Minute {
+			delete(h.logins, id)
+			continue
 		}
+		if pl.state != pendingStateActive {
+			continue
+		}
+		traceMatch := traceID != "" && machineTraceID(pl.machineID, pl.deviceID) == traceID
+		machineMatch := machineID != "" && pl.machineID == machineID &&
+			(deviceID == "" || pl.deviceID == deviceID)
+		if !traceMatch && !machineMatch {
+			continue
+		}
+		// 消费掉 pending：并发/重放的回调不能再绑到同一流程。
+		pl.state = pendingStateProcessing
+		return pl, true
 	}
 	return nil, false
 }

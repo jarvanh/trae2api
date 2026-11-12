@@ -2,7 +2,8 @@
 //
 // 安全纪律（PLAN §4）：
 //   - 列表与 JSON 预览绝不返回完整 token，只给前缀 + 长度
-//   - 写操作经 withAdminAuth（Bearer 校验）
+//   - 所有管理接口（读写）经 withAdminAuth（Bearer 校验）
+//   - UID 必须过 auth.ValidUID 白名单后才拼落盘/删除路径
 //   - 回调链接只在服务端解析，前端不经手敏感数据
 package server
 
@@ -53,7 +54,7 @@ type packSummary struct {
 	ExpireFmt string `json:"expire_fmt"`
 }
 
-// adminAccounts GET /admin/api/accounts：列表（无鉴权，只读）。
+// adminAccounts GET /admin/api/accounts：列表（需 admin 鉴权，只读脱敏）。
 func (h *Handler) adminAccounts(w http.ResponseWriter, r *http.Request) {
 	statuses := h.cfg.Pool.List()
 	out := make([]accountSummary, 0, len(statuses))
@@ -168,9 +169,19 @@ func (h *Handler) adminImportAccount(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "import_failed", err.Error())
 		return
 	}
-	if a.FilePath == "" {
-		a.FilePath = auth.FilePathFor(h.cfg.AuthDir, a.UID)
+	// UID 来自回调/导入 JSON，落盘前必须过白名单（T1/T6）：
+	// 否则 "../x" 之类会穿越 auths 目录写出任意 trae-*.json。
+	if !auth.ValidUID(a.UID) {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_uid",
+			"uid must match ^[A-Za-z0-9_-]{1,64}$")
+		return
 	}
+	fp, fpErr := auth.FilePathFor(h.cfg.AuthDir, a.UID)
+	if fpErr != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_uid", fpErr.Error())
+		return
+	}
+	a.FilePath = fp
 
 	// 落盘（原子写，复用 auth.SaveAtomic）
 	if err := os.MkdirAll(h.cfg.AuthDir, 0o755); err != nil {
@@ -276,7 +287,18 @@ func (h *Handler) adminDeleteAccount(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "missing uid")
 		return
 	}
-	fp := auth.FilePathFor(h.cfg.AuthDir, uid)
+	// Go 1.22 mux 的 PathValue 已做一次 URL 解码，%2F/%2e%2e 会解成 /..；
+	// 删除是文件系统操作，必须过 UID 白名单（T6/T14）。
+	if !auth.ValidUID(uid) {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_uid",
+			"uid must match ^[A-Za-z0-9_-]{1,64}$")
+		return
+	}
+	fp, fpErr := auth.FilePathFor(h.cfg.AuthDir, uid)
+	if fpErr != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_uid", fpErr.Error())
+		return
+	}
 	removed := h.cfg.Pool.Remove(uid)
 	if !removed {
 		// 池中无但有残留文件 → 也清掉文件（幂等）
@@ -328,7 +350,12 @@ func (h *Handler) adminPatchAccount(w http.ResponseWriter, r *http.Request) {
 		}
 		a.Nickname = *req.Nickname
 		if a.FilePath == "" {
-			a.FilePath = auth.FilePathFor(h.cfg.AuthDir, uid)
+			fp, fpErr := auth.FilePathFor(h.cfg.AuthDir, uid)
+			if fpErr != nil {
+				writeOpenAIError(w, http.StatusBadRequest, "invalid_uid", fpErr.Error())
+				return
+			}
+			a.FilePath = fp
 		}
 		_ = a.SaveAtomic()
 	}
@@ -353,7 +380,12 @@ func (h *Handler) adminRefreshAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if a.FilePath == "" {
-		a.FilePath = auth.FilePathFor(h.cfg.AuthDir, uid)
+		fp, fpErr := auth.FilePathFor(h.cfg.AuthDir, uid)
+		if fpErr != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_uid", fpErr.Error())
+			return
+		}
+		a.FilePath = fp
 	}
 	if err := a.SaveAtomic(); err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "save_failed", err.Error())
@@ -367,7 +399,7 @@ func (h *Handler) adminRefreshAccount(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// adminAccountJSON GET /admin/api/accounts/{uid}/json：脱敏预览（只读，无鉴权但严格脱敏）。
+// adminAccountJSON GET /admin/api/accounts/{uid}/json：脱敏预览（需 admin 鉴权）。
 func (h *Handler) adminAccountJSON(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := h.cfg.Pool.AuthByUID(uid)

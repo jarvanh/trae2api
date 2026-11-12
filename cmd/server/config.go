@@ -5,6 +5,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -13,8 +15,9 @@ import (
 
 // Config 顶层配置。
 type Config struct {
-	Listen          string `json:"listen"`            // ":7864"
+	Listen          string `json:"listen"`            // "127.0.0.1:7864"（默认仅回环）
 	CallbackPort    string `json:"callback_port"`     // "18080"（TRAE 登录回调监听端口，0 = 不起）
+	CallbackListen  string `json:"callback_listen"`   // 可选 "host:port"；空 = 127.0.0.1:<callback_port>
 	APIKey          string `json:"-"`                 // 只读 env TW2A_API_KEY（不读 json）
 	AuthDir         string `json:"auth_dir"`          // "./auths"
 	UsageDir        string `json:"usage_dir"`         // "./data"（用量明细落盘目录，空 = 不落盘）
@@ -23,7 +26,7 @@ type Config struct {
 	WorkMode        string `json:"work_mode"`         // "auto" | "native" | "bridge" | "disabled" (默认 auto)
 	WorkHost        string `json:"work_host"`         // 官方 Work 专属端点 (默认 https://api5-normal.mchost.guru)
 	WorkBridgeURL   string `json:"work_bridge_url"`   // "http://host-gateway:7865" (本地 Work 积分桥接端点)
-	WorkBridgeToken string `json:"work_bridge_token"` // 访问 WorkBridge 的 Bearer token（空 = 不鉴权）
+	WorkBridgeToken string `json:"work_bridge_token"` // 访问 WorkBridge 的 Bearer token（必须显式配置，无内置默认值）
 
 	Cooldown struct {
 		PlanCredit  string `json:"plan_credit"`   // "12h"
@@ -72,7 +75,8 @@ type Config struct {
 // Default 返回默认配置。
 func Default() *Config {
 	c := &Config{
-		Listen:          ":7864",
+		// 默认只监听回环：避免空 APIKey 时把管理面板/代理裸奔到局域网（T2）。
+		Listen:          "127.0.0.1:7864",
 		CallbackPort:    "18080",
 		APIKey:          "",
 		AuthDir:         "./auths",
@@ -127,6 +131,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("TW2A_CALLBACK_PORT"); v != "" {
 		c.CallbackPort = v
+	}
+	if v := os.Getenv("TW2A_CALLBACK_LISTEN"); v != "" {
+		c.CallbackListen = v
 	}
 	if v := os.Getenv("TW2A_AUTH_DIR"); v != "" {
 		c.AuthDir = v
@@ -232,14 +239,63 @@ func (c *Config) normalize() error {
 		c.WorkMode = "auto"
 	}
 	if c.Listen == "" {
-		c.Listen = ":7864"
+		c.Listen = "127.0.0.1:7864"
 	}
-	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
-		c.Listen = ":" + c.Listen
+	// 只写了端口（如 "7864"）时按安全默认绑回环；要暴露到局域网请显式写
+	// "0.0.0.0:7864" / ":7864" 并配置 TW2A_API_KEY。
+	if !strings.Contains(c.Listen, ":") {
+		c.Listen = "127.0.0.1:" + c.Listen
 	}
-	// CallbackPort：空/未设 → 默认 18080；显式 "0" → 不起回调 server（纯手动粘贴模式）
+	// 空 APIKey + 非回环监听 = 管理面板/代理无鉴权暴露到网络，必须拒绝启动。
+	// 显式 ":7864" / "0.0.0.0:7864" 都算非回环（host 为空 = 全部网卡）。
+	if c.APIKey == "" && !isLoopbackListen(c.Listen) {
+		return fmt.Errorf("refusing to start: listen %q is not loopback while TW2A_API_KEY is empty; "+
+			"set TW2A_API_KEY or listen on 127.0.0.1 (e.g. TW2A_LISTEN=127.0.0.1:7864)", c.Listen)
+	}
+	// CallbackPort：空/未设 → 默认 18080；显式 "0" → 不起回调 server（纯手动粘贴模式）。
+	// 端口必须是纯数字，避免拼进 auth_callback_url 时注入额外 query/path。
 	if c.CallbackPort == "" {
 		c.CallbackPort = "18080"
 	}
+	if c.CallbackPort != "0" {
+		if n, err := strconv.Atoi(c.CallbackPort); err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("callback_port %q: must be 0 or a valid TCP port (1-65535)", c.CallbackPort)
+		}
+	}
+	// Work 桥接鉴权：删除历史硬编码默认 token（T12）。显式 bridge 模式没有
+	// token 即拒绝启动，避免带着一个「谁都知道的默认口令」连到桥接端。
+	if c.WorkMode == "bridge" && strings.TrimSpace(c.WorkBridgeToken) == "" {
+		return fmt.Errorf("work_bridge_token / TW2A_WORK_BRIDGE_TOKEN is required when work_mode=bridge " +
+			"(generate one with e.g. `openssl rand -hex 16`)")
+	}
 	return nil
+}
+
+// CallbackAddr 返回 TRAE 回调 server 的监听地址。
+// 默认只监听回环（浏览器在本机跳转 127.0.0.1:18080）；容器部署可显式
+// 设置 callback_listen=0.0.0.0:18080，并由 docker-compose 在宿主机侧
+// 绑定 127.0.0.1:18080 限制暴露面（T2/T8）。
+func (c *Config) CallbackAddr() string {
+	if c.CallbackListen != "" {
+		return c.CallbackListen
+	}
+	return net.JoinHostPort("127.0.0.1", c.CallbackPort)
+}
+
+// isLoopbackListen 判断监听地址的 host 是否仅回环。
+// host 为空（":7864"）代表全部网卡，不算回环；localhost / 127.0.0.0/8 / ::1 算。
+func isLoopbackListen(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// 没有端口的裸 host/port 已在上面补过冒号；这里按不安全处理。
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	return ip.IsLoopback()
 }

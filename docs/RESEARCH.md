@@ -107,7 +107,7 @@
 2. **完整抓包数据**：完整请求体结构及 38 个 Stream Chunks 样例已固化保存于 `frida/captured_work_packet.json`。
 
 ### 4.3 Docker 部署（方案 B host-gateway 拓扑）
-- **WorkBridge（扣分引擎）**：常驻宿主机 `traesolo-copy.app`，其 `bridge.js` 监听 `0.0.0.0:7865`，可选 Bearer token 鉴权（缺省 `twbridge-local-7f3a`）。
+- **WorkBridge（扣分引擎）**：常驻宿主机 `traesolo-copy.app`，其 `bridge.js` 监听 `0.0.0.0:7865`，可选 Bearer token 鉴权（token 由 `TW2A_WORK_BRIDGE_TOKEN` 显式注入，无内置默认值）。
 - **trae2api（Docker）**：`docker-compose.yml` 新增 `extra_hosts: host-gateway`，`TW2A_WORK_BRIDGE_URL=http://host-gateway:7865` + `TW2A_WORK_BRIDGE_TOKEN`。
 - **三条自动路由**：①请求 Work 模型直接走本地桥接；②免费通道 4008 自动降级；③账号全部冷却时兜底。
 - 已实测端到端通过：非流式/流式均返回正确内容，work_credits 实时扣减，普通模型(glm-5.2)在 ide_credits=0 时自动降级成功。

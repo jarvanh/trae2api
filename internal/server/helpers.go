@@ -3,6 +3,7 @@ package server
 
 import (
 	"encoding/json"
+	"html"
 	"io"
 	"net/http"
 	"os"
@@ -35,6 +36,10 @@ func authorizeRender(w http.ResponseWriter, status int, title, detail string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
+	// title/detail 可能含回调 query 里的 nickname/UID（不可信输入），
+	// 必须 HTML 转义后再拼进文档，防反射型 XSS（T5）。
+	title = html.EscapeString(title)
+	detail = html.EscapeString(detail)
 	// 极简内联 HTML，无外部依赖；样式 token 与 admin.html 接近。
 	html := `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">` +
 		`<meta name="viewport" content="width=device-width,initial-scale=1">` +

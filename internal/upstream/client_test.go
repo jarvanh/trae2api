@@ -6,8 +6,11 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"trae2api/internal/auth"
 )
@@ -424,5 +427,58 @@ func TestCheckinClaimSurfacesBusy(t *testing.T) {
 	var ce *CheckinError
 	if !errors.As(err, &ce) || ce.Code != CheckinBusyCode {
 		t.Errorf("错误类型=%T code 提取失败: %v", err, err)
+	}
+}
+
+// TestCrossHostRedirectBlocked 覆盖 T7：上游 3xx 指向另一个 host 时，
+// 不能把 Authorization/refreshToken 带过去；请求直接失败。
+func TestCrossHostRedirectBlocked(t *testing.T) {
+	var leaked int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&leaked, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 307/308 会重放带凭据的请求体；必须在这里被 CheckRedirect 拦下。
+		http.Redirect(w, r, target.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	defer origin.Close()
+
+	c := &Client{
+		HTTP:      &http.Client{CheckRedirect: sameHostRedirect, Timeout: 2 * time.Second},
+		AgentHost: origin.URL, UgHost: origin.URL, OAuthHost: origin.URL, ClientID: ClientID,
+	}
+	a := &auth.Auth{AccessToken: "at", RefreshToken: "rt", ApiHost: origin.URL}
+	if err := c.RefreshToken(a); err == nil {
+		t.Fatal("cross-host redirect should be blocked")
+	}
+	if got := atomic.LoadInt32(&leaked); got != 0 {
+		t.Fatalf("credentials were forwarded to redirect target (%d requests)", got)
+	}
+}
+
+// TestSameHostRedirectAllowed 同 host 重定向仍可跟随（避免把正常 30x 误杀）。
+func TestSameHostRedirectAllowed(t *testing.T) {
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("ok") == "" {
+			http.Redirect(w, r, srv.URL+r.URL.Path+"?ok=1", http.StatusTemporaryRedirect)
+			return
+		}
+		_, _ = w.Write([]byte(`{"Result":{"Token":"new-at","RefreshToken":"new-rt","TokenExpireAt":1786805537}}`))
+	}))
+	defer srv.Close()
+
+	c := &Client{
+		HTTP:      &http.Client{CheckRedirect: sameHostRedirect, Timeout: 2 * time.Second},
+		AgentHost: srv.URL, UgHost: srv.URL, OAuthHost: srv.URL, ClientID: ClientID,
+	}
+	a := &auth.Auth{AccessToken: "at", RefreshToken: "rt", ApiHost: srv.URL}
+	if err := c.RefreshToken(a); err != nil {
+		t.Fatalf("same-host redirect should be followed: %v", err)
+	}
+	if a.AccessToken != "new-at" {
+		t.Errorf("token=%q", a.AccessToken)
 	}
 }

@@ -140,6 +140,27 @@ type Client struct {
 	Function string
 }
 
+// 同源重定向策略：上游 API 的 30x 不应把 Authorization / refreshToken
+// 带去第三方 host（T7）。只跟随同 host 且不降级到 http 的重定向。
+const maxRedirects = 5
+
+func sameHostRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxRedirects {
+		return fmt.Errorf("stopped after %d redirects", maxRedirects)
+	}
+	if len(via) == 0 {
+		return nil
+	}
+	origin := via[0].URL
+	if !strings.EqualFold(req.URL.Host, origin.Host) {
+		return fmt.Errorf("blocked cross-host redirect: %s -> %s", origin.Host, req.URL.Host)
+	}
+	if strings.EqualFold(origin.Scheme, "https") && !strings.EqualFold(req.URL.Scheme, "https") {
+		return fmt.Errorf("blocked https -> %s redirect downgrade", req.URL.Scheme)
+	}
+	return nil
+}
+
 // New 生产默认值。配置连接池减少 TLS 握手。
 func New() *Client {
 	tr := &http.Transport{
@@ -149,8 +170,8 @@ func New() *Client {
 		ResponseHeaderTimeout: 120 * time.Second, // 首字节兜底（长推理预留），不限制整流时长
 	}
 	return &Client{
-		HTTP:       &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		StreamHTTP: &http.Client{Transport: tr}, // 无总超时
+		HTTP:       &http.Client{Timeout: 120 * time.Second, Transport: tr, CheckRedirect: sameHostRedirect},
+		StreamHTTP: &http.Client{Transport: tr, CheckRedirect: sameHostRedirect}, // 无总超时
 		AgentHost:  AgentHost,
 		UgHost:     UgHost,
 		OAuthHost:  OAuthHost,
@@ -493,7 +514,12 @@ func consumptionRate(raw string) float64 {
 // deviceID 为签到专用派生设备号（空串时回退 auth 文件里的 DeviceID）；
 // 请求头走 CheckinHeaders 极简形态，与 UgHeaders（积分查询）区分。
 func (c *Client) CheckinStatus(a *auth.Auth, deviceID string) (checkedIn bool, credits int64, enable bool, err error) {
-	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinStatus, bytes.NewReader([]byte("{}")))
+	return c.CheckinStatusCtx(context.Background(), a, deviceID)
+}
+
+// CheckinStatusCtx 同 CheckinStatus，但受 ctx 约束（管理面板扇出时用超时兜底）。
+func (c *Client) CheckinStatusCtx(ctx context.Context, a *auth.Auth, deviceID string) (checkedIn bool, credits int64, enable bool, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ugBase()+EpCheckinStatus, bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return false, 0, false, err
 	}
@@ -595,7 +621,12 @@ type PackDetail struct {
 // 数据源与 EntUsage 相同（ide_user_ent_usage），额外解析 expire_time/start_time；
 // 签到/登录赠送的积分是独立权益包，各自 30 天（或自然月）有效期，先进先出消耗。
 func (c *Client) PackList(a *auth.Auth) ([]PackDetail, error) {
-	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpEntUsage, bytes.NewReader([]byte("{}")))
+	return c.PackListCtx(context.Background(), a)
+}
+
+// PackListCtx 同 PackList，但受 ctx 约束（管理面板扇出时用超时兜底）。
+func (c *Client) PackListCtx(ctx context.Context, a *auth.Auth) ([]PackDetail, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ugBase()+EpEntUsage, bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return nil, err
 	}

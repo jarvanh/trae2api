@@ -379,7 +379,7 @@ let curAcctIds = [], curCreditIds = [], curModelIds = [];
 // 首次进入页面时拉取已保存顺序（拖动排序的结果），之后 render 才会按它排
 async function loadUIOrder(){
   try{
-    const r = await fetch('/admin/api/order', {cache:'no-store'});
+    const r = await fetch('/admin/api/order', {cache:'no-store', headers: authHeader()});
     if(!r.ok) return;
     const o = await r.json();
     acctOrder = o.accounts || [];
@@ -507,7 +507,7 @@ async function loadUsage(){
   try{
     const r = await fetch('/admin/api/usage?date='+encodeURIComponent(date)
       +'&range='+encodeURIComponent(usageRange)
-      +'&probe='+encodeURIComponent(probe)+'&limit='+encodeURIComponent(limit), {cache:'no-store'});
+      +'&probe='+encodeURIComponent(probe)+'&limit='+encodeURIComponent(limit), {cache:'no-store', headers: authHeader()});
     const d = await r.json();
     if(!r.ok){ box.innerHTML = '<div style="color:var(--bad)">加载失败：'+esc(apiErr(d))+'</div>'; return; }
     usageRows = d.entries || [];
@@ -714,8 +714,9 @@ async function loadModels(){
   const box = document.getElementById('modelTable');
   const meta = document.getElementById('modelsMeta');
   try{
-    const r = await fetch('/admin/api/models'+(showInternal?'?all=1':''), {cache:'no-store'});
+    const r = await fetch('/admin/api/models'+(showInternal?'?all=1':''), {cache:'no-store', headers: authHeader()});
     const d = await r.json();
+    if(!r.ok){ box.innerHTML = '<div style="color:var(--bad)">加载失败：'+esc(apiErr(d))+'</div>'; return; }
     modelRows = d.models || [];
     meta.textContent = (d.dynamic ? '实时表' : '静态回退表（上游不可用）')
       + ' · ' + modelRows.length + ' 个模型 · ' + (d.fetched_at||'')
@@ -729,8 +730,9 @@ async function loadModels(){
 /* ─── 账号管理 ─── */
 async function loadAccounts(){
   try{
-    const r = await fetch('/admin/api/accounts', {cache:'no-store'});
+    const r = await fetch('/admin/api/accounts', {cache:'no-store', headers: authHeader()});
     const d = await r.json();
+    if(!r.ok){ document.getElementById('acctTable').innerHTML = '<div style="color:var(--bad)">加载失败：'+esc(apiErr(d))+'</div>'; return; }
     renderAccounts(d.accounts||[]);
     document.getElementById('ts').textContent = '更新于 ' + new Date().toLocaleTimeString();
   }catch(e){
@@ -824,8 +826,9 @@ async function deleteAcct(uid){
   loadAccounts();
 }
 async function showJSON(uid){
-  const r = await fetch('/admin/api/accounts/'+encodeURIComponent(uid)+'/json', {cache:'no-store'});
+  const r = await fetch('/admin/api/accounts/'+encodeURIComponent(uid)+'/json', {cache:'no-store', headers: authHeader()});
   const d = await r.json();
+  if(!r.ok){ alert('读取失败：'+apiErr(d)); return; }
   document.getElementById('modalTitle').textContent = '凭证预览（脱敏）— '+(d.nickname||d.uid);
   document.getElementById('modalBody').textContent = JSON.stringify(d, null, 2);
   document.getElementById('modalBg').classList.add('show');
@@ -879,7 +882,7 @@ function pollLogin(pid){
     waited += 2;
     if(waited > 180){ clearInterval(loginPollTimer); st.className='login-status err'; st.textContent='登录超时（3分钟），请重试'; document.getElementById('loginBtn').disabled=false; return; }
     try{
-      const r = await fetch('/admin/api/login/result?pending_id='+encodeURIComponent(pid), {cache:'no-store'});
+      const r = await fetch('/admin/api/login/result?pending_id='+encodeURIComponent(pid), {cache:'no-store', headers: authHeader()});
       const d = await r.json();
       if(d.state==='success'){
         clearInterval(loginPollTimer);
@@ -982,8 +985,10 @@ function renderCredits(d){
 }
 async function loadCredits(){
   try{
-    const r = await fetch('/admin/api/credits', {cache:'no-store'});
-    renderCredits(await r.json());
+    const r = await fetch('/admin/api/credits', {cache:'no-store', headers: authHeader()});
+    const d = await r.json();
+    if(!r.ok){ document.getElementById('grid').innerHTML = '<div style="color:var(--bad)">加载失败：'+esc(apiErr(d))+'</div>'; return; }
+    renderCredits(d);
   }catch(e){
     document.getElementById('grid').innerHTML = '<div style="color:var(--bad)">加载失败：'+esc(e.message)+'</div>';
   }

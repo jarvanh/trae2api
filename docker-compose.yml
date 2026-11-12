@@ -15,10 +15,15 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - TW2A_API_KEY=${TW2A_API_KEY:?set TW2A_API_KEY in /dropbox/self-hosted/trae2api/.env}
+      # 容器内需要监听 0.0.0.0 才能被端口映射转发；宿主机侧仍只发布必要端口。
+      # 非容器部署的默认值是 127.0.0.1:7864（安全默认，见 config.go）。
+      - TW2A_LISTEN=${TW2A_LISTEN:-0.0.0.0:7864}
+      - TW2A_CALLBACK_LISTEN=${TW2A_CALLBACK_LISTEN:-0.0.0.0:18080}
       # Work 通道运行模式：auto (智能自动模式，推荐) | native | bridge | disabled
       - TW2A_WORK_MODE=${TW2A_WORK_MODE:-auto}
       - TW2A_WORK_BRIDGE_URL=${TW2A_WORK_BRIDGE_URL:-http://host-gateway:7865}
-      - TW2A_WORK_BRIDGE_TOKEN=${TW2A_WORK_BRIDGE_TOKEN:-twbridge-local-7f3a}
+      # 无内置默认口令；bridge 模式必须显式提供（openssl rand -hex 16）。
+      - TW2A_WORK_BRIDGE_TOKEN=${TW2A_WORK_BRIDGE_TOKEN:-}
       # 日粒度流水保留天数：超期归档成月汇总（保留统计、丢明细）后删除日文件。
       # 90 = 默认；0 = 不启用（永久保留明细）。每日签到轮次执行一次。
       - TW2A_USAGE_RETENTION_DAYS=${TW2A_USAGE_RETENTION_DAYS:-90}
@@ -26,7 +31,8 @@ services:
       - "host-gateway:host-gateway"
     ports:
       - "7864:7864"
-      - "18080:18080"
+      # TRAE 登录回调只需本机浏览器可达：宿主机侧强制绑定回环（T8）。
+      - "127.0.0.1:18080:18080"
     volumes:
       # 数据持久化于 Dropbox（fuse 挂载，权限位恒 666，容器 uid 10001 可读写）
       - /dropbox/self-hosted/trae2api/auths:/app/auths

@@ -30,6 +30,8 @@ docs/*
 *.log
 *.test
 __pycache__/
+# frida 逆向/抓包素材整体不入库（T13）
+/frida/
 frida/*.app/
 frida/*.log
 frida/captured_work_packet.json

@@ -63,6 +63,11 @@ func main() {
 		workCfg.Mode = upstream.WorkMode(cfg.WorkMode)
 	}
 	workClient := upstream.NewWorkClient(workCfg)
+	// 桥接鉴权无内置默认口令（T12）：bridge/auto 模式未配 token 时给出明确提示，
+	// 避免继续带着历史默认口令连桥接端。
+	if workClient.Mode() != upstream.WorkModeDisabled && workClient.Config().BridgeToken == "" {
+		log.Printf("warning: TW2A_WORK_BRIDGE_TOKEN is empty — bridge requests will be sent without Authorization; set it when the bridge enforces auth")
+	}
 
 	sch := scheduler.New(scheduler.Config{
 		Pool:         p,
@@ -132,14 +137,15 @@ func main() {
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
-	// 第二个 http.Server：监听 CallbackPort（默认 18080），只处理 /authorize 回调。
-	// 复用同一 Handler（/authorize 已在主 mux 注册）。
-	// cfg.CallbackPort == "0" 时不启动（纯手动粘贴模式）。
+	// 第二个 http.Server：TRAE 登录回调（默认 127.0.0.1:18080）。
+	// 只挂 /authorize 最小路由（CallbackHandler），不把 /admin、/v1 等完整
+	// Handler 暴露到回调端口（T8）。cfg.CallbackPort == "0" 时不启动。
 	var cbSrv *http.Server
 	if cfg.CallbackPort != "" && cfg.CallbackPort != "0" {
+		cbAddr := cfg.CallbackAddr()
 		cbSrv = &http.Server{
-			Addr:              ":" + cfg.CallbackPort,
-			Handler:           h,
+			Addr:              cbAddr,
+			Handler:           h.CallbackHandler(),
 			ReadHeaderTimeout: 30 * time.Second,
 		}
 		go func() {
@@ -149,10 +155,10 @@ func main() {
 			_ = cbSrv.Shutdown(sc)
 		}()
 		go func() {
-			log.Printf("trae2api callback server on :%s (TRAE login /authorize)", cfg.CallbackPort)
+			log.Printf("trae2api callback server on %s (TRAE login /authorize)", cbAddr)
 			if err := cbSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				// 端口被占用（login.sh / 旧实例）不致命，降级为手动粘贴模式。
-				log.Printf("callback server (:%s) failed: %v — web 登录降级为手动粘贴回调链接", cfg.CallbackPort, err)
+				log.Printf("callback server (%s) failed: %v — web 登录降级为手动粘贴回调链接", cbAddr, err)
 			}
 		}()
 	}

@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -172,5 +173,89 @@ func TestNeedsRefreshLocked(t *testing.T) {
 	a.mu.RUnlock()
 	if !need {
 		t.Error("expired token should need refresh under lock")
+	}
+}
+
+// TestValidUID 覆盖路径穿越/非法 UID（T1/T6/T14）。
+func TestValidUID(t *testing.T) {
+	valid := []string{"u1", "1000000000000000", "a_b-C9", strings.Repeat("a", 64)}
+	for _, uid := range valid {
+		if !ValidUID(uid) {
+			t.Errorf("ValidUID(%q)=false, want true", uid)
+		}
+	}
+	invalid := []string{
+		"", "../../etc/passwd", "..", ".", "a/b", `a\b`, "a.b", "a b",
+		"../trae-x", "x\x00y", "café", "uid%2f..", strings.Repeat("a", 65),
+	}
+	for _, uid := range invalid {
+		if ValidUID(uid) {
+			t.Errorf("ValidUID(%q)=true, want false", uid)
+		}
+	}
+}
+
+// TestFilePathForRejectsTraversal 落盘路径构造自身必须校验 UID。
+func TestFilePathForRejectsTraversal(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := FilePathFor(dir, "../../evil"); err == nil {
+		t.Fatal("FilePathFor accepted traversal uid")
+	}
+	if _, err := FilePathFor(dir, ""); err == nil {
+		t.Fatal("FilePathFor accepted empty uid")
+	}
+	fp, err := FilePathFor(dir, "user_1")
+	if err != nil {
+		t.Fatalf("valid uid rejected: %v", err)
+	}
+	if want := filepath.Join(dir, "trae-user_1.json"); fp != want {
+		t.Errorf("path=%q want %q", fp, want)
+	}
+	if filepath.Dir(fp) != dir {
+		t.Errorf("path escapes auth dir: %q", fp)
+	}
+}
+
+// TestSaveAtomicConcurrentDistinctInstances 同进程多个 Auth 实例并发写同一
+// FilePath：唯一临时文件名（T10）必须保证最终文件始终是完整 JSON，且不残留
+// 临时文件。旧实现固定 ".tmp" 会在并发下互相截断。
+func TestSaveAtomicConcurrentDistinctInstances(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "trae-concurrent.json")
+	const workers = 16
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			a := &Auth{
+				AccessToken: "at", RefreshToken: "rt", ExpiresAt: 1786805537,
+				UID: "concurrent", Nickname: "n", FilePath: fp,
+			}
+			for j := 0; j < 10; j++ {
+				if err := a.SaveAtomic(); err != nil {
+					t.Errorf("save worker %d: %v", i, err)
+					return
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	raw, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatalf("read final file: %v", err)
+	}
+	if _, err := Parse(raw); err != nil {
+		t.Fatalf("final file is not valid JSON after concurrent writes: %v\n%s", err, raw)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".trae-auth-") {
+			t.Errorf("leftover temp file: %s", e.Name())
+		}
 	}
 }

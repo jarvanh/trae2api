@@ -9,7 +9,12 @@ LOG_OUT="$DIR/frida/bridge.log"
 PLIST_LABEL="com.traework.workbridge"
 PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
 PORT=7865
-TOKEN="twbridge-local-7f3a"
+# 桥接鉴权 token 无内置默认值：必须由环境变量显式提供，且与 trae2api 的
+# TW2A_WORK_BRIDGE_TOKEN 保持一致（T12）。为空时仅提示，不阻断本地管理脚本。
+TOKEN="${TW2A_WORK_BRIDGE_TOKEN:-}"
+if [ -z "$TOKEN" ]; then
+    echo "[!] TW2A_WORK_BRIDGE_TOKEN 未设置：WorkBridge 将不接受 Bearer 鉴权请求" >&2
+fi
 
 function check_status() {
     local pid=$(pgrep -f "traesolo-copy.*/Electron" | head -n 1 || true)

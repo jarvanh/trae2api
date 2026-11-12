@@ -54,9 +54,10 @@ const (
 	EpQueryHistory    = "/api/agent/v3/query_history_state"
 	EpSyncHistory     = "/api/agent/v3/sync_history_state"
 
-	// 本地桥接缺省配置 (用于平滑回退)
-	DefaultWorkBridgeURL   = "http://127.0.0.1:7865"
-	DefaultWorkBridgeToken = "twbridge-local-7f3a"
+	// 本地桥接缺省配置 (用于平滑回退)。
+	// 注意：不提供内置 Bearer token 默认值——凭据必须由
+	// TW2A_WORK_BRIDGE_TOKEN / work_bridge_token 显式注入（T12）。
+	DefaultWorkBridgeURL = "http://127.0.0.1:7865"
 )
 
 // WorkMode 客户端运行模式
@@ -90,10 +91,9 @@ func DefaultWorkClientConfig() WorkClientConfig {
 		bridgeURL = DefaultWorkBridgeURL
 	}
 
+	// 空 = 不发送 Authorization（桥接端不强制鉴权时仍可用）；
+	// 绝不回落到硬编码的公共默认口令。
 	bridgeToken := os.Getenv("TW2A_WORK_BRIDGE_TOKEN")
-	if bridgeToken == "" {
-		bridgeToken = DefaultWorkBridgeToken
-	}
 
 	modeStr := strings.ToLower(strings.TrimSpace(os.Getenv("TW2A_WORK_MODE")))
 	var mode WorkMode
@@ -161,9 +161,11 @@ func NewWorkClient(configs ...WorkClientConfig) *WorkClient {
 	}
 
 	return &WorkClient{
-		cfg:        cfg,
-		http:       &http.Client{Transport: tr, Timeout: cfg.Timeout},
-		streamHTTP: &http.Client{Transport: tr},
+		cfg: cfg,
+		// 与 SOLO 客户端同一套重定向策略：禁止把 Authorization（Cloud-IDE-JWT
+		// / Bridge token）随 30x 带到第三方 host（T7）。
+		http:       &http.Client{Transport: tr, Timeout: cfg.Timeout, CheckRedirect: sameHostRedirect},
+		streamHTTP: &http.Client{Transport: tr, CheckRedirect: sameHostRedirect},
 	}
 }
 
