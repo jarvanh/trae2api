@@ -453,6 +453,13 @@ func displayableModel(invisible bool, id string) bool {
 }
 
 // modelList 动态获取模型列表并包装成 OpenAI 格式；失败回退静态表。
+// 2026-11-19：实测支持图片输入的模型族（1x1 PNG 探针 → 正确识别颜色）。
+// 新增模型必须先跑真实图片请求再往这里加，避免误标导致错误溢出。
+func isVisionCapableModel(id string) bool {
+	k := strings.ToLower(id)
+	return strings.Contains(k, "glm-5.3") || strings.Contains(k, "glm-4.6v") || strings.Contains(k, "glm-4.5v")
+}
+
 func (h *Handler) modelList() []map[string]any {
 	if infos := h.fetchDynamicModels(); len(infos) > 0 {
 		out := make([]map[string]any, 0, len(infos))
@@ -474,6 +481,13 @@ func (h *Handler) modelList() []map[string]any {
 			}
 			if mi.MaxTokens > 0 {
 				entry["max_output_tokens"] = mi.MaxTokens
+			}
+			// 2026-11-19 实测：glm-5.3-flash 能正确识别 1x1 红色 PNG（回答「红色」），
+			// 但上游 model_detail_list 不含视觉字段，OmniRoute 会因此拒绝所有图片请求。
+			// 只给实测过的 GLM 族补声明，其余模型保持上游原样，避免误标。
+			if isVisionCapableModel(mi.ID) {
+				entry["input_modalities"] = []string{"text", "image"}
+				entry["capabilities"] = map[string]any{"vision": true}
 			}
 			if mi.Rate > 0 {
 				entry["consumption_rate"] = mi.Rate
